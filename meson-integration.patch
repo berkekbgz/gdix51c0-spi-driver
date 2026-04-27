@@ -1,0 +1,101 @@
+diff --git a/libfprint/meson.build b/libfprint/meson.build
+index ae0f6e2..60c4c27 100644
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -135,6 +135,8 @@ driver_sources = {
+         [ 'drivers/elanmoc/elanmoc.c' ],
+     'elanspi' :
+         [ 'drivers/elanspi.c' ],
++    'gdix51c0' :
++        [ 'drivers/gdix51c0/gdix51c0.c', 'drivers/gdix51c0/gdix51c0-proto.c', 'drivers/gdix51c0/gdix51c0-tls.c' ],
+     'nb1010' :
+         [ 'drivers/nb1010.c' ],
+     'virtual_image' :
+@@ -166,6 +168,8 @@ helper_sources = {
+         [ ],
+     'udev' :
+         [ ],
++    'gpiod' :
++        [ ],
+     'virtual' :
+         [ 'drivers/virtual-device-listener.c' ],
+ }
+@@ -264,6 +268,22 @@ libnbis = static_library('nbis',
+     ]),
+     install: false)
+ 
++# SIGFM: SIFT-based matching for small-area sensors such as GDIX51C0.
++opencv_inc = include_directories('/usr/include/opencv4')
++opencv_core = cpp.find_library('opencv_core')
++opencv_features2d = cpp.find_library('opencv_features2d')
++opencv_flann = cpp.find_library('opencv_flann')
++opencv_imgproc = cpp.find_library('opencv_imgproc')
++opencv_dep = declare_dependency(
++    include_directories: opencv_inc,
++    dependencies: [opencv_core, opencv_features2d, opencv_flann, opencv_imgproc],
++)
++libsigfm = static_library('sigfm',
++    'sigfm/sigfm.cpp',
++    dependencies: [opencv_dep],
++    cpp_args: ['-std=c++17'],
++    install: false)
++
+ libfprint_private = static_library('fprint-private',
+     sources: [
+         fpi_enums,
+@@ -277,7 +297,7 @@ libfprint_drivers = static_library('fprint-drivers',
+     sources: drivers_sources,
+     c_args: drivers_cflags,
+     dependencies: deps,
+-    link_with: libfprint_private,
++    link_with: [libfprint_private, libsigfm],
+     install: false)
+ 
+ mapfile = files('libfprint.ver')[0]
+@@ -299,8 +319,8 @@ libfprint = shared_library(versioned_libname.split('lib')[1],
+     version: libversion,
+     link_args : vflag,
+     link_depends : mapfile,
+-    link_with: [libfprint_drivers, libfprint_private],
+-    dependencies: deps,
++    link_with: [libfprint_drivers, libfprint_private, libsigfm],
++    dependencies: deps + [opencv_dep],
+     install: true)
+ 
+ libfprint_dep = declare_dependency(link_with: libfprint,
+diff --git a/meson.build b/meson.build
+index 14fb11f..4f651db 100644
+--- a/meson.build
++++ b/meson.build
+@@ -147,7 +147,8 @@ default_drivers = [
+ ]
+ 
+ spi_drivers = [
+-    'elanspi'
++    'elanspi',
++    'gdix51c0'
+ ]
+ 
+ if have_spi
+@@ -211,6 +212,7 @@ driver_helper_mapping = {
+     'aes4000' : [ 'aeslib', 'aes3k' ],
+     'uru4000' : [ 'openssl' ],
+     'elanspi' : [ 'udev' ],
++    'gdix51c0' : [ 'udev', 'openssl', 'gpiod' ],
+     'virtual_image'          : [ 'virtual' ],
+     'virtual_device'         : [ 'virtual' ],
+     'virtual_device_storage' : [ 'virtual' ],
+@@ -284,6 +286,13 @@ foreach i : driver_helpers
+         libfprint_conf.set10('HAVE_UDEV', true)
+ 
+         optional_deps += gudev_dep
++    elif i == 'gpiod'
++        gpiod_dep = dependency('libgpiod', version: '>= 2.0', required: false)
++        if not gpiod_dep.found()
++            error('libgpiod >= 2.0 is required for @0@ and possibly others'.format(driver))
++        endif
++
++        optional_deps += gpiod_dep
+     endif
+ endforeach
+ 

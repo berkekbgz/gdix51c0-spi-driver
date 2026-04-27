@@ -1,0 +1,1143 @@
+/*
+ * Goodix GDIX51C0 SPI driver for libfprint
+ *
+ * Copyright (C) 2026 Berke Kabagoz
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ */
+
+#define FP_COMPONENT "gdix51c0"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+#include <gpiod.h>
+#include <linux/spi/spidev.h>
+
+#include "drivers_api.h"
+#include "fpi-spi-transfer.h"
+
+#include "gdix51c0.h"
+#include "gdix51c0-proto.h"
+#include "gdix51c0-tls.h"
+#include "sigfm/sigfm.hpp"
+
+struct _FpiDeviceGdix51c0
+{
+  FpDevice                   parent;
+
+  /* hardware handles */
+  int                        spi_fd;
+  struct gpiod_chip         *gpio_chip;
+  struct gpiod_line_request *irq_req;
+  unsigned int               irq_offset;
+  unsigned int               reset_offset;
+  struct gpiod_edge_event_buffer *irq_events;
+
+  /* TLS state (populated for each enroll/verify/identify session) */
+  Gdix51c0Tls                   tls;
+  gboolean                   tls_ready;
+
+  gboolean                   skip_next_identify;
+};
+
+G_DEFINE_TYPE (FpiDeviceGdix51c0, fpi_device_gdix51c0, FP_TYPE_DEVICE);
+
+/* ------------------------------------------------------------------ */
+/* GPIO bring-up                                                       */
+/* ------------------------------------------------------------------ */
+
+static int
+gdix51c0_env_int (const char *name, int fallback)
+{
+  const char *s = g_getenv (name);
+  if (!s || !*s)
+    return fallback;
+  return (int) g_ascii_strtoll (s, NULL, 0);
+}
+
+/* libgpiod v2: chip → line settings → line config → request.  For the
+ * IRQ line we also enable both-edge detection so the kernel buffers
+ * events for us; that beats polling for short MCU pulses. */
+static struct gpiod_line_request *
+gdix51c0_request_line (struct gpiod_chip   *chip,
+                    unsigned int         offset,
+                    enum gpiod_line_direction dir,
+                    int                  initial_high,
+                    gboolean             want_edges,
+                    const char          *consumer,
+                    GError             **err)
+{
+  struct gpiod_line_settings *settings = gpiod_line_settings_new ();
+  struct gpiod_line_config   *line_cfg = gpiod_line_config_new ();
+  struct gpiod_request_config *req_cfg = gpiod_request_config_new ();
+  struct gpiod_line_request  *req      = NULL;
+
+  if (!settings || !line_cfg || !req_cfg)
+    {
+      g_set_error (err, G_IO_ERROR, G_IO_ERROR_FAILED,
+                   "gdix51c0: gpiod alloc failed");
+      goto out;
+    }
+
+  gpiod_line_settings_set_direction (settings, dir);
+  if (dir == GPIOD_LINE_DIRECTION_OUTPUT)
+    gpiod_line_settings_set_output_value (settings,
+                                          initial_high ? GPIOD_LINE_VALUE_ACTIVE
+                                                       : GPIOD_LINE_VALUE_INACTIVE);
+  if (want_edges)
+    gpiod_line_settings_set_edge_detection (settings, GPIOD_LINE_EDGE_BOTH);
+
+  if (gpiod_line_config_add_line_settings (line_cfg, &offset, 1, settings) < 0)
+    {
+      g_set_error (err, G_IO_ERROR, g_io_error_from_errno (errno),
+                   "gdix51c0: gpiod add line %u failed", offset);
+      goto out;
+    }
+  gpiod_request_config_set_consumer (req_cfg, consumer);
+
+  req = gpiod_chip_request_lines (chip, req_cfg, line_cfg);
+  if (!req)
+    g_set_error (err, G_IO_ERROR, g_io_error_from_errno (errno),
+                 "gdix51c0: request line %u failed", offset);
+
+out:
+  if (settings) gpiod_line_settings_free (settings);
+  if (line_cfg) gpiod_line_config_free (line_cfg);
+  if (req_cfg)  gpiod_request_config_free (req_cfg);
+  return req;
+}
+
+static gboolean
+gdix51c0_open_gpios (FpiDeviceGdix51c0 *self, GError **err)
+{
+  const char *chip_path = g_getenv (GDIX51C0_ENV_GPIOCHIP);
+
+  if (!chip_path || !*chip_path)
+    chip_path = GDIX51C0_DEFAULT_GPIOCHIP;
+
+  self->irq_offset   = gdix51c0_env_int (GDIX51C0_ENV_IRQ_LINE,   GDIX51C0_DEFAULT_IRQ_LINE);
+  self->reset_offset = gdix51c0_env_int (GDIX51C0_ENV_RESET_LINE, GDIX51C0_DEFAULT_RESET_LINE);
+
+  self->gpio_chip = gpiod_chip_open (chip_path);
+  if (!self->gpio_chip)
+    {
+      g_set_error (err, G_IO_ERROR, g_io_error_from_errno (errno),
+                   "gdix51c0: open gpiochip %s failed", chip_path);
+      return FALSE;
+    }
+
+  self->irq_req = gdix51c0_request_line (self->gpio_chip, self->irq_offset,
+                                      GPIOD_LINE_DIRECTION_INPUT, 0,
+                                      TRUE /* edges */,
+                                      "gdix51c0-irq", err);
+  if (!self->irq_req)
+    return FALSE;
+
+  /* Buffer up to 16 pending edges; we typically expect 2-4 per cmd. */
+  self->irq_events = gpiod_edge_event_buffer_new (16);
+  if (!self->irq_events)
+    {
+      g_set_error_literal (err, G_IO_ERROR, G_IO_ERROR_FAILED,
+                           "gdix51c0: alloc edge event buffer failed");
+      return FALSE;
+    }
+
+  /* Reset line is opened on-demand inside reset_pulse — see comment
+   * there for why we don't keep a persistent OUTPUT request. */
+  return TRUE;
+}
+
+static void
+gdix51c0_close_gpios (FpiDeviceGdix51c0 *self)
+{
+  g_clear_pointer (&self->irq_req,    gpiod_line_request_release);
+  g_clear_pointer (&self->irq_events, gpiod_edge_event_buffer_free);
+  g_clear_pointer (&self->gpio_chip,  gpiod_chip_close);
+}
+
+/* ------------------------------------------------------------------ */
+/* Device open/close                                                   */
+/* ------------------------------------------------------------------ */
+
+static void
+gdix51c0_open (FpDevice *dev)
+{
+  FpiDeviceGdix51c0 *self = FPI_DEVICE_GDIX51C0 (dev);
+  GError *err = NULL;
+
+  G_DEBUG_HERE ();
+
+  const char *spi_path = fpi_device_get_udev_data (dev, FPI_DEVICE_UDEV_SUBTYPE_SPIDEV);
+  fp_dbg ("gdix51c0: opening spidev at %s", spi_path ? spi_path : "(null)");
+  if (!spi_path)
+    {
+      g_set_error_literal (&err, G_IO_ERROR, G_IO_ERROR_NOT_FOUND,
+                           "gdix51c0: spidev node not found");
+      fpi_device_open_complete (dev, err);
+      return;
+    }
+
+  self->spi_fd = open (spi_path, O_RDWR);
+  if (self->spi_fd < 0)
+    {
+      g_set_error (&err, G_IO_ERROR, g_io_error_from_errno (errno),
+                   "gdix51c0: open spidev %s failed", spi_path);
+      fpi_device_open_complete (dev, err);
+      return;
+    }
+
+  /* Match Python: 10 MHz, mode 0, 8 bits/word.  Without this we inherit
+   * whatever the kernel set the fd to. */
+  guint32 speed = GDIX51C0_SPI_SPEED_HZ;
+  guint8  mode  = GDIX51C0_SPI_MODE;
+  guint8  bpw   = 8;
+  if (ioctl (self->spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0 ||
+      ioctl (self->spi_fd, SPI_IOC_WR_MODE,         &mode)  < 0 ||
+      ioctl (self->spi_fd, SPI_IOC_WR_BITS_PER_WORD, &bpw)  < 0)
+    {
+      g_set_error (&err, G_IO_ERROR, g_io_error_from_errno (errno),
+                   "gdix51c0: spidev configure failed");
+      close (self->spi_fd);
+      self->spi_fd = -1;
+      fpi_device_open_complete (dev, err);
+      return;
+    }
+  /* Read back to confirm the kernel honored what we asked for. */
+  guint32 actual_speed = 0;
+  guint8  actual_mode  = 0xff;
+  guint8  actual_bpw   = 0;
+  ioctl (self->spi_fd, SPI_IOC_RD_MAX_SPEED_HZ, &actual_speed);
+  ioctl (self->spi_fd, SPI_IOC_RD_MODE,         &actual_mode);
+  ioctl (self->spi_fd, SPI_IOC_RD_BITS_PER_WORD, &actual_bpw);
+  fp_dbg ("gdix51c0: spidev configured: speed=%u Hz mode=0x%02x bpw=%u",
+          actual_speed, actual_mode, actual_bpw);
+
+  if (!gdix51c0_open_gpios (self, &err))
+    {
+      close (self->spi_fd);
+      self->spi_fd = -1;
+      gdix51c0_close_gpios (self);
+      fpi_device_open_complete (dev, err);
+      return;
+    }
+
+  fpi_device_open_complete (dev, NULL);
+}
+
+static void
+gdix51c0_close (FpDevice *dev)
+{
+  FpiDeviceGdix51c0 *self = FPI_DEVICE_GDIX51C0 (dev);
+
+  G_DEBUG_HERE ();
+
+  if (self->tls_ready)
+    {
+      gdix51c0_tls_free (&self->tls);
+      self->tls_ready = FALSE;
+    }
+
+  if (self->spi_fd >= 0)
+    {
+      close (self->spi_fd);
+      self->spi_fd = -1;
+    }
+  gdix51c0_close_gpios (self);
+
+  fpi_device_close_complete (dev, NULL);
+}
+
+/* Reset + post-reset IRQ pulse + force-unlock-TLS (cmd 0xd5, no ack). */
+static gboolean
+gdix51c0_boot_probe (FpiDeviceGdix51c0 *self, GError **error)
+{
+  Gdix51c0Bus bus = {
+    .dev = FP_DEVICE (self), .spi_fd = self->spi_fd,
+    .irq_req = self->irq_req, .irq_offset = self->irq_offset,
+    .irq_events = self->irq_events,
+  };
+
+  gdix51c0_irq_drain (self->irq_req, self->irq_events);
+  if (!gdix51c0_reset_pulse (self->gpio_chip, self->reset_offset, error))
+    return FALSE;
+
+  if (!gdix51c0_irq_wait (self->irq_req, self->irq_events, TRUE,
+                       self->irq_offset, GDIX51C0_BOOT_TIMEOUT_USEC,
+                       "boot-rise", error))
+    return FALSE;
+  if (!gdix51c0_irq_wait (self->irq_req, self->irq_events, FALSE,
+                       self->irq_offset, GDIX51C0_BOOT_TIMEOUT_USEC,
+                       "boot-fall", error))
+    return FALSE;
+
+  /* Settle delay: the rise/fall we just caught may be a GPIO glitch from
+   * our reset toggle, not the MCU's actual post-reset boot pulse.  Give
+   * the MCU at least 100ms to fully boot, then drain any later edges so
+   * the cmd flow starts from a clean kernel buffer. */
+  g_usleep (200000);
+  gdix51c0_irq_drain (self->irq_req, self->irq_events);
+
+  static const guint8 d5_payload[] = { 0xd5, 0x03, 0x00, 0x00, 0x00, 0xd3 };
+  return gdix51c0_cmd_no_ack (&bus, d5_payload, sizeof (d5_payload),
+                           "force-unlock-tls", error);
+}
+
+/* Full 14213 pre-TLS init sequence — every byte mirrors
+ * protocol_interaction.py from get_evk_version() through "upload mcu config".
+ * The MCU rejects cmd 0xd1 (TLS trigger) until this whole sequence has run. */
+static gboolean
+gdix51c0_init_sequence (FpiDeviceGdix51c0 *self, GError **error)
+{
+  Gdix51c0Bus bus = {
+    .dev = FP_DEVICE (self), .spi_fd = self->spi_fd,
+    .irq_req = self->irq_req, .irq_offset = self->irq_offset,
+    .irq_events = self->irq_events,
+  };
+
+  /* "required for ..." prefix: 01 05 00 00 00 00 00 88 — no ack.
+   * Sent once before get_evk_version and once before get_mcu_state. */
+  static const guint8 prefix01[] = { 0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88 };
+
+  /* get_evk_version: prefix → 50ms → cmd 0xa8 (ack+resp same cycle) */
+  if (!gdix51c0_cmd_no_ack (&bus, prefix01, sizeof (prefix01), "evk-prefix", error))
+    return FALSE;
+  g_usleep (50000);
+  static const guint8 a8_payload[] = { 0xa8, 0x03, 0x00, 0x00, 0x00, 0xff };
+  if (!gdix51c0_cmd_ack_resp (&bus, a8_payload, sizeof (a8_payload),
+                           "get-evk-version", error))
+    return FALSE;
+
+  /* get_mcu_state: prefix → 50ms → cmd 0xaf with timestamp + ts-checksum
+   * (single response, no ack — only one IRQ cycle).  We can reuse cmd_resp-
+   * style flow: write, IRQ rise, read, IRQ fall.  No ack-only read.        */
+  if (!gdix51c0_cmd_no_ack (&bus, prefix01, sizeof (prefix01), "mcu-state-prefix", error))
+    return FALSE;
+  g_usleep (50000);
+  {
+    GDateTime *now = g_date_time_new_now_utc ();
+    guint ms = g_date_time_get_seconds (now) * 1000.0;
+    g_date_time_unref (now);
+    guint16 ms16 = (guint16) (ms & 0xffff);
+
+    guint8 af_data[7];
+    af_data[0] = 0xaf;
+    af_data[1] = 0x06; af_data[2] = 0x00;        /* inner len */
+    af_data[3] = 0x55;
+    af_data[4] = ms16 & 0xff; af_data[5] = (ms16 >> 8) & 0xff;
+    af_data[6] = 0x00;
+    guint8 csum = gdix51c0_payload_checksum_ts (af_data, sizeof (af_data));
+    guint8 af_full[9];
+    memcpy (af_full, af_data, sizeof (af_data));
+    af_full[7] = 0x00;        /* python: af 06 00 55 ms_lo ms_hi 00 00 csum */
+    af_full[8] = csum;
+
+    /* MCU pushes a single response frame, one IRQ cycle. We treat it as
+     * "cmd_ack" semantics where the "ack" IS the response. */
+    if (!gdix51c0_cmd_ack (&bus, af_full, sizeof (af_full), "get-mcu-state", error))
+      return FALSE;
+  }
+
+  /* reset_sensor (cmd 0xa2) — ack then response in separate IRQ cycles */
+  static const guint8 a2_payload[] = { 0xa2, 0x03, 0x00, 0x01, 0x14, 0xf0 };
+  if (!gdix51c0_cmd_ack_then_resp (&bus, a2_payload, sizeof (a2_payload),
+                                "reset-sensor-1", error))
+    return FALSE;
+
+  /* get MILAN_CHIPID (cmd 0x82) — ack+resp same cycle */
+  static const guint8 chip_payload[] = { 0x82, 0x06, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x1e };
+  if (!gdix51c0_cmd_ack_resp (&bus, chip_payload, sizeof (chip_payload),
+                           "milan-chipid", error))
+    return FALSE;
+
+  /* get OTP (cmd 0xa6) — ack then response in separate IRQ cycles */
+  static const guint8 otp_payload[] = { 0xa6, 0x03, 0x00, 0x00, 0x00, 0x01 };
+  if (!gdix51c0_cmd_ack_then_resp (&bus, otp_payload, sizeof (otp_payload),
+                                "get-otp", error))
+    return FALSE;
+
+  /* reset_sensor again */
+  if (!gdix51c0_cmd_ack_then_resp (&bus, a2_payload, sizeof (a2_payload),
+                                "reset-sensor-2", error))
+    return FALSE;
+
+  /* setmode idle (cmd 0x70) — ack only, no separate response */
+  static const guint8 setmode_idle[] = { 0x70, 0x03, 0x00, 0x14, 0x00, 0x23 };
+  if (!gdix51c0_cmd_ack (&bus, setmode_idle, sizeof (setmode_idle),
+                      "setmode-idle", error))
+    return FALSE;
+
+  /* send Dac 0x380bb500b300b300 (cmd 0x98) — ack+resp same cycle */
+  static const guint8 dac_payload[] = {
+    0x98, 0x09, 0x00, 0x38, 0x0b, 0xb5, 0x00, 0xb3, 0x00, 0xb3, 0x00, 0xab
+  };
+  if (!gdix51c0_cmd_ack_resp (&bus, dac_payload, sizeof (dac_payload),
+                           "send-dac", error))
+    return FALSE;
+
+  /* upload mcu config (cmd 0x90) — 232-byte payload, ack+resp same cycle */
+  static const guint8 cfg_payload[] = {
+    0x90, 0xE1, 0x00, 0x70, 0x11, 0x74, 0x85, 0x00, 0x85, 0x2C, 0xB1, 0x18, 0xC9, 0x14, 0xDD, 0x00,
+    0xDD, 0x00, 0xDD, 0x00, 0xBA, 0x00, 0x01, 0x80, 0xCA, 0x00, 0x04, 0x00, 0x84, 0x00, 0x15, 0xB3,
+    0x86, 0x00, 0x00, 0xC4, 0x88, 0x00, 0x00, 0xBA, 0x8A, 0x00, 0x00, 0xB2, 0x8C, 0x00, 0x00, 0xAA,
+    0x8E, 0x00, 0x00, 0xC1, 0x90, 0x00, 0xBB, 0xBB, 0x92, 0x00, 0xB1, 0xB1, 0x94, 0x00, 0x00, 0xA8,
+    0x96, 0x00, 0x00, 0xB6, 0x98, 0x00, 0x00, 0x00, 0x9A, 0x00, 0x00, 0x00, 0xD2, 0x00, 0x00, 0x00,
+    0xD4, 0x00, 0x00, 0x00, 0xD6, 0x00, 0x00, 0x00, 0xD8, 0x00, 0x00, 0x00, 0x50, 0x00, 0x01, 0x05,
+    0xD0, 0x00, 0x00, 0x00, 0x70, 0x00, 0x00, 0x00, 0x72, 0x00, 0x78, 0x56, 0x74, 0x00, 0x34, 0x12,
+    0x20, 0x00, 0x10, 0x40, 0x5C, 0x00, 0x00, 0x01, 0x20, 0x02, 0x38, 0x0B, 0x36, 0x02, 0xB5, 0x00,
+    0x38, 0x02, 0xB3, 0x00, 0x3A, 0x02, 0xB3, 0x00, 0x2A, 0x01, 0x82, 0x03, 0x22, 0x00, 0x01, 0x20,
+    0x24, 0x00, 0x14, 0x00, 0x80, 0x00, 0x01, 0x00, 0x5C, 0x00, 0x00, 0x01, 0x56, 0x00, 0x04, 0x20,
+    0x58, 0x00, 0x03, 0x02, 0x32, 0x00, 0x0C, 0x02, 0x66, 0x00, 0x03, 0x00, 0x7C, 0x00, 0x00, 0x58,
+    0x82, 0x00, 0x80, 0x1B, 0x2A, 0x01, 0x08, 0x00, 0x54, 0x00, 0x10, 0x01, 0x62, 0x00, 0x04, 0x03,
+    0x64, 0x00, 0x19, 0x00, 0x66, 0x00, 0x03, 0x00, 0x7C, 0x00, 0x00, 0x58, 0x2A, 0x01, 0x08, 0x00,
+    0x52, 0x00, 0x08, 0x00, 0x54, 0x00, 0x00, 0x01, 0x66, 0x00, 0x03, 0x00, 0x7C, 0x00, 0x00, 0x58,
+    0x00, 0x53, 0x66, 0x8F
+  };
+  if (!gdix51c0_cmd_ack_resp (&bus, cfg_payload, sizeof (cfg_payload),
+                           "upload-mcu-config", error))
+    return FALSE;
+
+  fp_dbg ("gdix51c0: pre-TLS init sequence complete");
+  return TRUE;
+}
+
+static gboolean
+gdix51c0_load_psk (guint8 out[32], GError **err)
+{
+  const char *hex = g_getenv (GDIX51C0_ENV_PSK_HEX);
+  if (!hex || !*hex)
+    {
+      g_set_error (err, G_IO_ERROR, G_IO_ERROR_NOT_INITIALIZED,
+                   "gdix51c0: $%s not set; full activation needs the 32-byte PSK in hex",
+                   GDIX51C0_ENV_PSK_HEX);
+      return FALSE;
+    }
+  if (strlen (hex) != 64)
+    {
+      g_set_error (err, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                   "gdix51c0: $%s must be 64 hex chars (got %zu)",
+                   GDIX51C0_ENV_PSK_HEX, strlen (hex));
+      return FALSE;
+    }
+  for (int i = 0; i < 32; i++)
+    {
+      char b[3] = { hex[2*i], hex[2*i + 1], 0 };
+      gchar *endp = NULL;
+      out[i] = (guint8) g_ascii_strtoull (b, &endp, 16);
+      if (!endp || *endp != 0)
+        {
+          g_set_error_literal (err, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                               "gdix51c0: bad hex in PSK env");
+          return FALSE;
+        }
+    }
+  return TRUE;
+}
+
+static void gdix51c0_session_deactivate (FpiDeviceGdix51c0 *self);
+
+static gboolean
+gdix51c0_session_activate_once (FpiDeviceGdix51c0 *self, GError **error)
+{
+  guint8 psk[32];
+
+  G_DEBUG_HERE ();
+
+  if (!gdix51c0_boot_probe (self, error))
+    return FALSE;
+
+  if (!gdix51c0_init_sequence (self, error))
+    return FALSE;
+
+  if (!gdix51c0_load_psk (psk, error))
+    return FALSE;
+
+  if (!gdix51c0_tls_init (&self->tls, FP_DEVICE (self), self->spi_fd,
+                       self->irq_req, self->irq_events, self->irq_offset,
+                       psk, sizeof (psk), error))
+    return FALSE;
+
+  if (!gdix51c0_tls_handshake (&self->tls, error))
+    {
+      gdix51c0_tls_free (&self->tls);
+      return FALSE;
+    }
+  self->tls_ready = TRUE;
+
+  /* Post-TLS init: cmd 0xd4 (ack-only) + cmd 0x50 nav-base (ack+resp).
+   * Run once per session — primes the MCU for image capture. */
+  Gdix51c0Bus bus = {
+    .dev = FP_DEVICE (self), .spi_fd = self->spi_fd,
+    .irq_req = self->irq_req, .irq_offset = self->irq_offset,
+    .irq_events = self->irq_events,
+  };
+  g_usleep (100000);  /* python: manual_sleep(0.1) before cmd 0xd4 */
+
+  static const guint8 d4_payload[] = { 0xd4, 0x03, 0x00, 0x00, 0x00, 0xd3 };
+  if (!gdix51c0_cmd_ack (&bus, d4_payload, sizeof (d4_payload),
+                      "post-tls-d4", error))
+    {
+      gdix51c0_tls_free (&self->tls);
+      self->tls_ready = FALSE;
+      return FALSE;
+    }
+
+  /* Python POC has an input() prompt between d4 and nav-base that pauses
+   * several seconds — without an explicit gap nav-base's IRQ rise never
+   * fires here.  500ms seems to be enough on this hardware. */
+  g_usleep (500000);
+
+  static const guint8 nav_base_payload[] = { 0x50, 0x03, 0x00, 0x01, 0x00, 0x56 };
+  if (!gdix51c0_cmd_ack_resp (&bus, nav_base_payload, sizeof (nav_base_payload),
+                           "nav-base", error))
+    {
+      gdix51c0_tls_free (&self->tls);
+      self->tls_ready = FALSE;
+      return FALSE;
+    }
+
+  fp_dbg ("gdix51c0: ready for capture (TLS + nav-base done)");
+  return TRUE;
+}
+
+static gboolean
+gdix51c0_session_activate (FpiDeviceGdix51c0 *self, GError **error)
+{
+  for (guint attempt = 0; attempt < 2; attempt++)
+    {
+      g_autoptr(GError) local_error = NULL;
+
+      if (gdix51c0_session_activate_once (self, &local_error))
+        return TRUE;
+
+      gdix51c0_session_deactivate (self);
+      if (!g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT) ||
+          attempt == 1)
+        {
+          g_propagate_error (error, g_steal_pointer (&local_error));
+          return FALSE;
+        }
+
+      fp_warn ("gdix51c0: activation timed out (%s); resetting and retrying",
+               local_error->message);
+      g_usleep (100000);
+    }
+
+  g_assert_not_reached ();
+  return FALSE;
+}
+
+static void
+gdix51c0_session_deactivate (FpiDeviceGdix51c0 *self)
+{
+  G_DEBUG_HERE ();
+
+  if (self->tls_ready)
+    {
+      gdix51c0_tls_free (&self->tls);
+      self->tls_ready = FALSE;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Image decode: 6 packed bytes -> 4 12-bit samples (kept as guint16   */
+/* for downstream diff/normalization).  Mirrors image_decode.py.       */
+/* ------------------------------------------------------------------ */
+static void
+gdix51c0_decode_12bpp_to_16bpp (const guint8 *packed, gsize packed_len,
+                             guint16 *out16, gsize out_pixels)
+{
+  /* 6 packed bytes encode 4 12-bit samples (per python image_decode):
+   *   o1 = ((c[0] & 0xf) << 8) | c[1]
+   *   o2 = (c[3] << 4)         | (c[0] >> 4)
+   *   o3 = ((c[5] & 0xf) << 8) | c[2]
+   *   o4 = (c[4] << 4)         | (c[5] >> 4)
+   */
+  gsize chunks = MIN (packed_len / 6, out_pixels / 4);
+  for (gsize i = 0; i < chunks; i++)
+    {
+      const guint8 *c = packed + i * 6;
+      out16[i*4 + 0] = (((guint16) (c[0] & 0x0f)) << 8) | c[1];
+      out16[i*4 + 1] = (((guint16) c[3])         << 4) | (c[0] >> 4);
+      out16[i*4 + 2] = (((guint16) (c[5] & 0x0f)) << 8) | c[2];
+      out16[i*4 + 3] = (((guint16) c[4])         << 4) | (c[5] >> 4);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* One round of FDT-down (cmd 0x32): write setmode, read ack, read     */
+/* response.  Sets *touchflag to response byte [5] (0x3f when finger    */
+/* present, 0x00 when not).  Used by the finger-detection poll.         */
+/* ------------------------------------------------------------------ */
+static gboolean
+gdix51c0_fdt_down_round (FpiDeviceGdix51c0 *self,
+                         guint              finger_timeout_usec,
+                         guint8            *touchflag,
+                         GError           **error)
+{
+  /* Build FDT-down setmode packet (cmd 0x32):
+   *   inner: 0x32 | LE16 inner_len | 0x08 0x01 | 12 register bytes |
+   *          2-byte timestamp | csum
+   * Register bytes captured cold from windows/WBDI.log line 50. */
+  static const guint8 fdt_regs[12] = {
+    0x80, 0xad, 0x80, 0xbb, 0x80, 0xa2, 0x80, 0xae, 0x80, 0xa3, 0x80, 0xae
+  };
+  guint8 fdt_data[2 + 12 + 2];
+  fdt_data[0] = 0x08; fdt_data[1] = 0x01;
+  memcpy (&fdt_data[2], fdt_regs, 12);
+  fdt_data[14] = 0xcd; fdt_data[15] = 0xab;       /* timestamp LE: 0xabcd */
+  gsize fdt_pkt_len = 0;
+  g_autofree guint8 *fdt_packet =
+    gdix51c0_make_payload_packet (GDIX51C0_CMD_FDT_DOWN, fdt_data, sizeof (fdt_data),
+                               &fdt_pkt_len);
+
+  if (!gdix51c0_spi_write (FP_DEVICE (self), self->spi_fd, GDIX51C0_PKT_WRITE,
+                        fdt_packet, fdt_pkt_len, error))
+    return FALSE;
+  if (!gdix51c0_irq_wait (self->irq_req, self->irq_events, TRUE,
+                       self->irq_offset, GDIX51C0_FDT_TIMEOUT_USEC,
+                       "fdt-down-ack-rise", error))
+    return FALSE;
+  {
+    gsize n = 0;
+    g_autofree guint8 *ack = gdix51c0_spi_read (FP_DEVICE (self), self->spi_fd, &n, error);
+    if (!ack)
+      return FALSE;
+  }
+  if (!gdix51c0_irq_wait (self->irq_req, self->irq_events, FALSE,
+                       self->irq_offset, GDIX51C0_FDT_TIMEOUT_USEC,
+                       "fdt-down-ack-fall", error))
+    return FALSE;
+
+  if (!gdix51c0_irq_wait (self->irq_req, self->irq_events, TRUE,
+                       self->irq_offset, finger_timeout_usec,
+                       "fdt-down-finger-rise", error))
+    return FALSE;
+  gsize n = 0;
+  g_autofree guint8 *fdt_resp = gdix51c0_spi_read (FP_DEVICE (self), self->spi_fd, &n, error);
+  if (!fdt_resp)
+    return FALSE;
+  if (!gdix51c0_irq_wait (self->irq_req, self->irq_events, FALSE,
+                       self->irq_offset, GDIX51C0_FDT_TIMEOUT_USEC,
+                       "fdt-down-finger-fall", error))
+    return FALSE;
+
+  *touchflag = (n > 5) ? fdt_resp[5] : 0;
+  return TRUE;
+}
+
+/* ------------------------------------------------------------------ */
+/* Arm FDT-down once and let the kernel block on the sensor GPIO IRQ.   */
+/* Re-arm only after a real zero-touch/spurious FDT response.            */
+/* ------------------------------------------------------------------ */
+static gboolean
+gdix51c0_wait_for_finger (FpiDeviceGdix51c0 *self, GError **error)
+{
+  gint64 finger_deadline = g_get_monotonic_time () +
+                           (gint64) GDIX51C0_FINGER_TIMEOUT_USEC;
+  fp_dbg ("gdix51c0: arming FDT-down and waiting for finger GPIO IRQ...");
+
+  for (;;)
+    {
+      guint8 touchflag = 0;
+      gint64 now = g_get_monotonic_time ();
+      guint remaining_usec;
+
+      if (now >= finger_deadline)
+        {
+          g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
+                               "gdix51c0: no finger detected within timeout");
+          return FALSE;
+        }
+
+      remaining_usec = (guint) MIN (finger_deadline - now,
+                                    (gint64) G_MAXUINT);
+
+      /* Drop stale command IRQs before arming a fresh FDT wait.  Do not drain
+       * after the ACK cycle; an already-present finger may queue its rise
+       * immediately after the ACK fall and that edge must remain pending. */
+      gdix51c0_irq_drain (self->irq_req, self->irq_events);
+
+      if (!gdix51c0_fdt_down_round (self, remaining_usec, &touchflag, error))
+        return FALSE;
+      if (touchflag != 0)
+        {
+          fp_dbg ("gdix51c0: finger detected, touchflag=0x%02x", touchflag);
+          return TRUE;
+        }
+
+      fp_dbg ("gdix51c0: ignoring zero-touch FDT event; re-arming");
+      g_usleep (20000);
+    }
+}
+
+/* Wait for finger lift with short FDT-down probes.  touchflag returns 0 once
+ * the finger is no longer touching.  Used between enroll stages so libfprint's
+ * "place finger again" prompt is honoured instead of capturing the same frame
+ * back-to-back. */
+static gboolean
+gdix51c0_wait_for_lift (FpiDeviceGdix51c0 *self, GError **error)
+{
+  fp_dbg ("gdix51c0: waiting for finger lift (short FDT-down probes)...");
+  gint64 lift_deadline = g_get_monotonic_time () +
+                         (gint64) GDIX51C0_FINGER_TIMEOUT_USEC;
+  for (;;)
+    {
+      guint8 touchflag = 0xff;
+      if (!gdix51c0_fdt_down_round (self, GDIX51C0_FDT_TIMEOUT_USEC,
+                                    &touchflag, error))
+        return FALSE;
+      if (touchflag == 0)
+        {
+          fp_dbg ("gdix51c0: finger lifted");
+          return TRUE;
+        }
+      if (g_get_monotonic_time () >= lift_deadline)
+        {
+          g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
+                               "gdix51c0: finger not lifted within timeout");
+          return FALSE;
+        }
+      g_usleep (100000);
+    }
+}
+
+static gboolean
+gdix51c0_wait_irq_level (FpiDeviceGdix51c0 *self,
+                         gboolean           high,
+                         guint              timeout_usec,
+                         const char        *label,
+                         GError           **error)
+{
+  enum gpiod_line_value value =
+    gpiod_line_request_get_value (self->irq_req, self->irq_offset);
+
+  if (value < 0)
+    {
+      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+                   "gdix51c0: %s: get IRQ value failed", label);
+      return FALSE;
+    }
+  if ((value == GPIOD_LINE_VALUE_ACTIVE) == high)
+    return TRUE;
+
+  return gdix51c0_irq_wait (self->irq_req, self->irq_events, high,
+                            self->irq_offset, timeout_usec, label, error);
+}
+
+/* ------------------------------------------------------------------ */
+/* Single image capture (cmd 0x22 -> ack -> read -> decrypt -> decode). */
+/* Returns a fresh guint16[GDIX51C0_FRAME_PIXELS] on success.              */
+/* ------------------------------------------------------------------ */
+static guint16 *
+gdix51c0_capture_image_raw (FpiDeviceGdix51c0 *self, GError **error)
+{
+  static const guint8 img_setmode[] = { 0x22, 0x03, 0x00, 0x01, 0x00, 0x84 };
+
+  /* The FDT response and image setmode are separate IRQ cycles.  After many
+   * enroll stages the MCU occasionally needs a short idle gap here; otherwise
+   * cmd 0x22 can be written while the IRQ line is still settling and no ACK is
+   * produced. */
+  g_usleep (20000);
+  gdix51c0_irq_drain (self->irq_req, self->irq_events);
+  if (!gdix51c0_wait_irq_level (self, FALSE, GDIX51C0_FDT_TIMEOUT_USEC,
+                                "img-pre-idle", error))
+    return NULL;
+
+  if (!gdix51c0_spi_write (FP_DEVICE (self), self->spi_fd, GDIX51C0_PKT_WRITE,
+                        img_setmode, sizeof (img_setmode), error))
+    return NULL;
+  if (!gdix51c0_irq_wait (self->irq_req, self->irq_events, TRUE,
+                       self->irq_offset, GDIX51C0_FDT_TIMEOUT_USEC,
+                       "img-ack-rise", error))
+    return NULL;
+  {
+    gsize n = 0;
+    g_autofree guint8 *ack = gdix51c0_spi_read (FP_DEVICE (self), self->spi_fd, &n, error);
+    if (!ack)
+      return NULL;
+  }
+  if (!gdix51c0_irq_wait (self->irq_req, self->irq_events, FALSE,
+                       self->irq_offset, GDIX51C0_FDT_TIMEOUT_USEC,
+                       "img-ack-fall", error))
+    return NULL;
+
+  if (!gdix51c0_irq_wait (self->irq_req, self->irq_events, TRUE,
+                       self->irq_offset, GDIX51C0_IMAGE_TIMEOUT_USEC,
+                       "img-rise", error))
+    return NULL;
+  gsize record_len = 0;
+  g_autofree guint8 *encrypted =
+    gdix51c0_spi_read (FP_DEVICE (self), self->spi_fd, &record_len, error);
+  if (!encrypted)
+    return NULL;
+  if (!gdix51c0_irq_wait (self->irq_req, self->irq_events, FALSE,
+                       self->irq_offset, GDIX51C0_IMAGE_TIMEOUT_USEC,
+                       "img-fall", error))
+    return NULL;
+
+  gsize plain_len = 0;
+  g_autofree guint8 *plain =
+    gdix51c0_tls_decrypt_record (&self->tls, encrypted, record_len, &plain_len, error);
+  if (!plain)
+    return NULL;
+
+  if (plain_len < 3 + 5 + 1 + 4 + GDIX51C0_FRAME_BYTES)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                   "gdix51c0: image plaintext too short (%zu)", plain_len);
+      return NULL;
+    }
+  const guint8 *image_packed = plain + 3 + 5;        /* skip 3-byte cmd + 5 zeros */
+
+  guint16 *raw = g_malloc (GDIX51C0_FRAME_PIXELS * sizeof (guint16));
+  gdix51c0_decode_12bpp_to_16bpp (image_packed, GDIX51C0_FRAME_BYTES,
+                               raw, GDIX51C0_FRAME_PIXELS);
+  return raw;
+}
+
+/* ------------------------------------------------------------------ */
+/* Top-level capture: wait for finger, capture one native 64x80 frame, */
+/* contrast-normalize it, and return the 8-bit frame for SIGFM.         */
+/* ------------------------------------------------------------------ */
+static guint8 *
+gdix51c0_capture_one_raw8 (FpiDeviceGdix51c0 *self, GError **error)
+{
+  if (!gdix51c0_wait_for_finger (self, error))
+    return NULL;
+
+  fpi_device_report_finger_status (FP_DEVICE (self), FP_FINGER_STATUS_PRESENT);
+
+  g_autofree guint16 *raw = gdix51c0_capture_image_raw (self, error);
+  if (!raw)
+    return NULL;
+
+  /* Per-frame contrast stretch from the sensor's narrow dynamic range
+   * (typically ~1000..2400 of the 12-bit space, ie ~80 of 255 after a
+   * plain >>4) to the full 8-bit range.  SIGFM/SIFT also needs local
+   * contrast; the raw frame is otherwise too flat for stable keypoints. */
+  guint16 mn = 0xffff, mx = 0;
+  for (gsize i = 0; i < GDIX51C0_FRAME_PIXELS; i++)
+    {
+      if (raw[i] < mn) mn = raw[i];
+      if (raw[i] > mx) mx = raw[i];
+    }
+  guint span = mx > mn ? (guint) (mx - mn) : 1;
+  guint8 small_px[GDIX51C0_FRAME_PIXELS];
+  for (gsize i = 0; i < GDIX51C0_FRAME_PIXELS; i++)
+    {
+      guint v = ((guint) (raw[i] - mn) * 255u + span / 2) / span;
+      /* Invert: the sensor reports capacitive contact as higher values;
+       * keeping ridges dark matches the SIGFM training assumptions. */
+      small_px[i] = (guint8) (255u - MIN (v, 255u));
+    }
+
+  if (g_getenv ("GDIX51C0_DUMP_FRAMES"))
+    {
+      /* Optional side-dump for visual sanity checks. */
+      g_autofree char *path = g_strdup_printf ("/tmp/gdix51c0_frame_%" G_GINT64_FORMAT ".pgm",
+                                               g_get_monotonic_time ());
+      FILE *fp = fopen (path, "wb");
+      if (fp)
+        {
+          fprintf (fp, "P5\n%d %d\n255\n", GDIX51C0_SENSOR_WIDTH, GDIX51C0_SENSOR_HEIGHT);
+          fwrite (small_px, 1, GDIX51C0_FRAME_PIXELS, fp);
+          fclose (fp);
+        }
+    }
+
+  return g_memdup2 (small_px, GDIX51C0_FRAME_PIXELS);
+}
+
+static void
+gdix51c0_wait_for_lift_report (FpiDeviceGdix51c0 *self)
+{
+  GError *lift_err = NULL;
+
+  if (!gdix51c0_wait_for_lift (self, &lift_err))
+    {
+      fp_warn ("gdix51c0: lift wait failed (%s), reporting off anyway",
+               lift_err ? lift_err->message : "?");
+      g_clear_error (&lift_err);
+    }
+  fpi_device_report_finger_status (FP_DEVICE (self), FP_FINGER_STATUS_NONE);
+}
+
+static gint
+gdix51c0_match_print (SigfmImgInfo *probe_info,
+                      FpPrint      *print,
+                      gint         *out_matching_samples,
+                      GError      **error)
+{
+  g_autoptr(GVariant) data = NULL;
+  GVariantIter iter;
+  GVariant *child;
+  gint best_score = 0;
+  gint matching_samples = 0;
+  gint sample_idx = 0;
+
+  g_object_get (G_OBJECT (print), "fpi-data", &data, NULL);
+  if (!data || !g_variant_is_of_type (data, G_VARIANT_TYPE ("aay")))
+    {
+      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                           "gdix51c0: enrolled print is not SIGFM raw image data");
+      return -1;
+    }
+
+  g_variant_iter_init (&iter, data);
+  while ((child = g_variant_iter_next_value (&iter)))
+    {
+      gsize len = 0;
+      const guint8 *image = g_variant_get_fixed_array (child, &len, 1);
+
+      if (len == GDIX51C0_FRAME_PIXELS)
+        {
+          SigfmImgInfo *template_info = sigfm_extract (image,
+                                                       GDIX51C0_SENSOR_WIDTH,
+                                                       GDIX51C0_SENSOR_HEIGHT);
+          gint score = sigfm_match_score (probe_info, template_info);
+          fp_dbg ("gdix51c0: sample %d SIGFM score %d", sample_idx, score);
+          sigfm_free_info (template_info);
+
+          if (score >= GDIX51C0_SIGFM_THRESHOLD)
+            matching_samples++;
+          if (score > best_score)
+            best_score = score;
+        }
+
+      sample_idx++;
+      g_variant_unref (child);
+    }
+
+  if (out_matching_samples)
+    *out_matching_samples = matching_samples;
+  return best_score;
+}
+
+static gboolean
+gdix51c0_sigfm_is_match (gint best_score, gint matching_samples)
+{
+  return best_score >= GDIX51C0_SIGFM_BEST_MIN &&
+         matching_samples >= GDIX51C0_SIGFM_MIN_SAMPLES;
+}
+
+static void
+gdix51c0_enroll (FpDevice *dev)
+{
+  FpiDeviceGdix51c0 *self = FPI_DEVICE_GDIX51C0 (dev);
+  g_autoptr(GPtrArray) images = NULL;
+  GError *error = NULL;
+  FpPrint *print = NULL;
+
+  if (!gdix51c0_session_activate (self, &error))
+    goto out;
+
+  images = g_ptr_array_new_with_free_func (g_free);
+  for (gint stage = 0; stage < GDIX51C0_ENROLL_SAMPLES; stage++)
+    {
+      guint8 *image;
+
+      fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED);
+      image = gdix51c0_capture_one_raw8 (self, &error);
+      if (!image)
+        goto out;
+
+      g_ptr_array_add (images, image);
+      fpi_device_enroll_progress (dev, stage + 1, NULL, NULL);
+
+      if (stage + 1 < GDIX51C0_ENROLL_SAMPLES)
+        gdix51c0_wait_for_lift_report (self);
+    }
+
+  fpi_device_get_enroll_data (dev, &print);
+  fpi_print_set_type (print, FPI_PRINT_RAW);
+
+  {
+    GVariantBuilder builder;
+    g_autoptr(GVariant) data = NULL;
+
+    g_variant_builder_init (&builder, G_VARIANT_TYPE ("aay"));
+    for (guint i = 0; i < images->len; i++)
+      {
+        guint8 *image = g_ptr_array_index (images, i);
+        g_variant_builder_add (&builder, "@ay",
+                               g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
+                                                          image,
+                                                          GDIX51C0_FRAME_PIXELS,
+                                                          sizeof (guint8)));
+      }
+
+    data = g_variant_ref_sink (g_variant_builder_end (&builder));
+    g_object_set (G_OBJECT (print), "fpi-data", data, NULL);
+  }
+
+  self->skip_next_identify = TRUE;
+  fp_info ("gdix51c0: enrollment complete with %d SIGFM samples",
+           GDIX51C0_ENROLL_SAMPLES);
+
+out:
+  gdix51c0_session_deactivate (self);
+  if (error)
+    fpi_device_enroll_complete (dev, NULL, error);
+  else
+    fpi_device_enroll_complete (dev, g_object_ref (print), NULL);
+}
+
+static void
+gdix51c0_verify_or_identify (FpDevice *dev)
+{
+  FpiDeviceGdix51c0 *self = FPI_DEVICE_GDIX51C0 (dev);
+  FpiDeviceAction action = fpi_device_get_current_action (dev);
+  g_autofree guint8 *image = NULL;
+  SigfmImgInfo *probe_info = NULL;
+  GError *error = NULL;
+
+  if (!gdix51c0_session_activate (self, &error))
+    goto out;
+
+  fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED);
+  image = gdix51c0_capture_one_raw8 (self, &error);
+  if (!image)
+    goto out;
+
+  probe_info = sigfm_extract (image, GDIX51C0_SENSOR_WIDTH, GDIX51C0_SENSOR_HEIGHT);
+  fp_dbg ("gdix51c0: SIGFM probe keypoints: %d",
+          sigfm_keypoints_count (probe_info));
+
+  if (action == FPI_DEVICE_ACTION_VERIFY)
+    {
+      FpPrint *template = NULL;
+      gint best_score = 0;
+      gint matching_samples = 0;
+      FpiMatchResult result;
+
+      fpi_device_get_verify_data (dev, &template);
+      best_score = gdix51c0_match_print (probe_info, template,
+                                         &matching_samples, &error);
+      if (error)
+        goto out;
+
+      fp_dbg ("gdix51c0: verify best SIGFM score %d, matching samples %d",
+              best_score, matching_samples);
+      result = gdix51c0_sigfm_is_match (best_score, matching_samples) ?
+               FPI_MATCH_SUCCESS : FPI_MATCH_FAIL;
+      fpi_device_verify_report (dev, result, NULL, NULL);
+    }
+  else
+    {
+      GPtrArray *gallery = NULL;
+      FpPrint *match = NULL;
+      gint best_score = 0;
+      gint best_matching_samples = 0;
+
+      fpi_device_get_identify_data (dev, &gallery);
+      for (guint i = 0; i < gallery->len; i++)
+        {
+          FpPrint *candidate = g_ptr_array_index (gallery, i);
+          gint matching_samples = 0;
+          gint score = gdix51c0_match_print (probe_info, candidate,
+                                             &matching_samples, &error);
+          if (error)
+            goto out;
+
+          if (gdix51c0_sigfm_is_match (score, matching_samples) &&
+              score > best_score)
+            {
+              best_score = score;
+              best_matching_samples = matching_samples;
+              match = candidate;
+            }
+        }
+
+      fp_dbg ("gdix51c0: identify best SIGFM score %d, matching samples %d",
+              best_score, best_matching_samples);
+      fpi_device_identify_report (dev, match, NULL, NULL);
+    }
+
+out:
+  if (probe_info)
+    sigfm_free_info (probe_info);
+  if (image)
+    gdix51c0_wait_for_lift_report (self);
+  gdix51c0_session_deactivate (self);
+
+  if (action == FPI_DEVICE_ACTION_VERIFY)
+    fpi_device_verify_complete (dev, error);
+  else
+    fpi_device_identify_complete (dev, error);
+}
+
+static void
+gdix51c0_verify (FpDevice *dev)
+{
+  gdix51c0_verify_or_identify (dev);
+}
+
+static void
+gdix51c0_identify (FpDevice *dev)
+{
+  FpiDeviceGdix51c0 *self = FPI_DEVICE_GDIX51C0 (dev);
+
+  if (self->skip_next_identify)
+    {
+      self->skip_next_identify = FALSE;
+      fp_dbg ("gdix51c0: skipping post-enrollment duplicate check");
+      fpi_device_identify_report (dev, NULL, NULL, NULL);
+      fpi_device_identify_complete (dev, NULL);
+      return;
+    }
+
+  gdix51c0_verify_or_identify (dev);
+}
+
+/* ------------------------------------------------------------------ */
+/* GObject boilerplate                                                 */
+/* ------------------------------------------------------------------ */
+
+static void
+fpi_device_gdix51c0_init (FpiDeviceGdix51c0 *self)
+{
+  self->spi_fd = -1;
+}
+
+static void
+fpi_device_gdix51c0_finalize (GObject *gobject)
+{
+  gdix51c0_session_deactivate (FPI_DEVICE_GDIX51C0 (gobject));
+  G_OBJECT_CLASS (fpi_device_gdix51c0_parent_class)->finalize (gobject);
+}
+
+static void
+fpi_device_gdix51c0_class_init (FpiDeviceGdix51c0Class *klass)
+{
+  FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
+
+  dev_class->id               = "gdix51c0";
+  dev_class->full_name        = "Goodix GDIX51C0 Fingerprint Sensor";
+  dev_class->type             = FP_DEVICE_TYPE_UDEV;
+  dev_class->id_table         = gdix51c0_id_table;
+  dev_class->scan_type        = FP_SCAN_TYPE_PRESS;
+  /* Bumped from 5 to 10: with a tiny 64x80 (~3-4mm) sensor each press
+   * covers a small area, so a single template doesn't span enough finger
+   * to reliably overlap with a random-position verify capture.  More
+   * stages -> more template coverage -> higher hit rate. */
+  dev_class->nr_enroll_stages = GDIX51C0_ENROLL_SAMPLES;
+  dev_class->temp_hot_seconds = -1;
+  dev_class->open             = gdix51c0_open;
+  dev_class->close            = gdix51c0_close;
+  dev_class->enroll           = gdix51c0_enroll;
+  dev_class->verify           = gdix51c0_verify;
+  dev_class->identify         = gdix51c0_identify;
+
+  fpi_device_class_auto_initialize_features (dev_class);
+
+  G_OBJECT_CLASS (klass)->finalize = fpi_device_gdix51c0_finalize;
+}
