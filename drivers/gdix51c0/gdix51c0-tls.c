@@ -115,7 +115,25 @@ gdix51c0_bio_read (BIO *b, char *buf, int len)
                     error ? error->message : "?");
             g_clear_error (&error);
 
-            gdix51c0_irq_drain (tls->irq_req, tls->irq_events);
+            {
+              g_autoptr(GError) idle_error = NULL;
+
+              gdix51c0_irq_drain (tls->irq_req, tls->irq_events);
+
+              if (!gdix51c0_irq_wait (tls->irq_req,
+                                      tls->irq_events,
+                                      FALSE,
+                                      tls->irq_offset,
+                                      500000,
+                                      "tls-pre-idle",
+                                      &idle_error))
+                {
+                  fp_dbg ("gdix51c0: TLS pre-idle wait failed, continuing anyway: %s",
+                          idle_error ? idle_error->message : "?");
+                }
+
+              gdix51c0_irq_drain (tls->irq_req, tls->irq_events);
+            }
 
             if (!gdix51c0_irq_wait (tls->irq_req,
                                     tls->irq_events,
@@ -309,56 +327,133 @@ gdix51c0_tls_init (Gdix51c0Tls *tls,
   return TRUE;
 }
 
-gboolean
-gdix51c0_tls_handshake (Gdix51c0Tls *tls, GError **error)
+static gboolean
+gdix51c0_tls_recreate_ssl (Gdix51c0Tls *tls, GError **error)
 {
-  /*
-   * Kick the MCU to start TLS. Important:
-   *
-   * Do NOT use gdix51c0_cmd_ack(), gdix51c0_cmd_ack_optional_resp(), or
-   * gdix51c0_cmd_ack_then_resp() here.
-   *
-   * The packet that arrives after 0xd1 is not a normal Goodix ACK in your
-   * trace; it was 52 bytes, which is consistent with TLS handshake data.
-   * If we read it here, OpenSSL never sees it and SSL_accept later times out.
-   */
-  static const guint8 d1_payload[] = {
-    0xd1, 0x03, 0x00, 0x00, 0x00, 0xd7
-  };
-
-  gdix51c0_irq_drain (tls->irq_req, tls->irq_events);
-
-  if (!gdix51c0_spi_write (tls->dev,
-                           tls->spi_fd,
-                           GDIX51C0_PKT_WRITE,
-                           d1_payload,
-                           sizeof (d1_payload),
-                           error))
-    return FALSE;
-
-  /*
-   * Now let OpenSSL drive the protocol. The first call into BIO_read will
-   * wait for IRQ high and read the 52-byte packet itself.
-   */
-  int rc = SSL_accept (tls->ssl);
-  if (rc <= 0)
-    {
-      int ssl_err = SSL_get_error (tls->ssl, rc);
-      g_propagate_error (error, gdix51c0_openssl_error ("SSL_accept"));
-      fp_warn ("gdix51c0: SSL_accept rc=%d ssl_err=%d", rc, ssl_err);
-      return FALSE;
-    }
-
-  fp_dbg ("gdix51c0: TLS handshake complete (cipher=%s)",
-          SSL_get_cipher (tls->ssl));
-
   g_free (tls->rd_buf);
   tls->rd_buf = NULL;
   tls->rd_off = 0;
   tls->rd_len = 0;
-  gdix51c0_irq_drain (tls->irq_req, tls->irq_events);
+
+  if (tls->ssl)
+    {
+      SSL_free (tls->ssl);
+      tls->ssl = NULL;
+      tls->bio = NULL; /* owned/freed by SSL */
+    }
+
+  tls->ssl = SSL_new (tls->ctx);
+  if (!tls->ssl)
+    {
+      g_propagate_error (error, gdix51c0_openssl_error ("SSL_new retry"));
+      return FALSE;
+    }
+
+  SSL_set_app_data (tls->ssl, tls);
+
+  tls->bio = BIO_new (gdix51c0_bio_method ());
+  if (!tls->bio)
+    {
+      g_propagate_error (error, gdix51c0_openssl_error ("BIO_new retry"));
+      return FALSE;
+    }
+
+  BIO_set_data (tls->bio, tls);
+  SSL_set_bio (tls->ssl, tls->bio, tls->bio);
+  SSL_set_accept_state (tls->ssl);
 
   return TRUE;
+}
+
+gboolean
+gdix51c0_tls_handshake (Gdix51c0Tls *tls, GError **error)
+{
+  static const guint8 d1_payload[] = {
+    0xd1, 0x03, 0x00, 0x00, 0x00, 0xd7
+  };
+
+  for (guint attempt = 0; attempt < 2; attempt++)
+    {
+      g_autoptr(GError) local_error = NULL;
+
+      fp_dbg ("gdix51c0: TLS handshake attempt %u", attempt + 1);
+
+      if (attempt > 0)
+        {
+          if (!gdix51c0_tls_recreate_ssl (tls, &local_error))
+            {
+              g_propagate_error (error, g_steal_pointer (&local_error));
+              return FALSE;
+            }
+
+          g_usleep (200000);
+        }
+
+      gdix51c0_irq_drain (tls->irq_req, tls->irq_events);
+
+      if (!gdix51c0_irq_wait (tls->irq_req,
+                              tls->irq_events,
+                              FALSE,
+                              tls->irq_offset,
+                              500000,
+                              "tls-pre-idle",
+                              &local_error))
+        {
+          fp_dbg ("gdix51c0: TLS pre-idle wait failed, continuing anyway: %s",
+                  local_error ? local_error->message : "?");
+          g_clear_error (&local_error);
+        }
+
+      gdix51c0_irq_drain (tls->irq_req, tls->irq_events);
+
+      if (!gdix51c0_spi_write (tls->dev,
+                               tls->spi_fd,
+                               GDIX51C0_PKT_WRITE,
+                               d1_payload,
+                               sizeof (d1_payload),
+                               &local_error))
+        {
+          g_propagate_error (error, g_steal_pointer (&local_error));
+          return FALSE;
+        }
+
+      int rc = SSL_accept (tls->ssl);
+      if (rc > 0)
+        {
+          fp_dbg ("gdix51c0: TLS handshake complete (cipher=%s)",
+                  SSL_get_cipher (tls->ssl));
+
+          g_free (tls->rd_buf);
+          tls->rd_buf = NULL;
+          tls->rd_off = 0;
+          tls->rd_len = 0;
+
+          gdix51c0_irq_drain (tls->irq_req, tls->irq_events);
+          return TRUE;
+        }
+
+      int ssl_err = SSL_get_error (tls->ssl, rc);
+
+      fp_warn ("gdix51c0: SSL_accept attempt %u rc=%d ssl_err=%d",
+               attempt + 1, rc, ssl_err);
+
+      gdix51c0_irq_drain (tls->irq_req, tls->irq_events);
+
+      if (attempt == 0)
+        continue;
+
+      g_set_error (error,
+                   G_IO_ERROR,
+                   G_IO_ERROR_CONNECTION_CLOSED,
+                   "gdix51c0: TLS handshake did not receive MCU ClientHello");
+      return FALSE;
+    }
+
+  g_set_error_literal (error,
+                       G_IO_ERROR,
+                       G_IO_ERROR_CONNECTION_CLOSED,
+                       "gdix51c0: TLS handshake failed");
+  return FALSE;
 }
 
 gboolean

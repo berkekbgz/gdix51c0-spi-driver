@@ -158,3 +158,12 @@ gdix51c0_irq_wait_edge_strict (struct gpiod_line_request *irq_req,
                                guint timeout_usec,
                                const char *label,
                                GError **error);
+
+guint8 *
+gdix51c0_cmd_single_resp_level (Gdix51c0Bus *bus,
+                                const guint8 *payload,
+                                gsize len,
+                                guint timeout_usec,
+                                gsize *out_len,
+                                const char *label,
+                                GError **error);

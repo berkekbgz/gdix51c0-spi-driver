@@ -162,11 +162,29 @@ gdix51c0_spi_read (FpDevice *dev, int spi_fd, gsize *out_len, GError **error)
   (void) dev;
 
   guint8 hdr[4];
+  gboolean saw_all_zero = FALSE;
+  gboolean saw_all_ff = FALSE;
 
-  if (!gdix51c0_spi_xfer_read (spi_fd, hdr, sizeof (hdr), error))
-    return NULL;
+  for (guint attempt = 0; attempt < 4; attempt++)
+    {
+      if (!gdix51c0_spi_xfer_read (spi_fd, hdr, sizeof (hdr), error))
+        return NULL;
 
-  if (hdr[0] == 0 && hdr[1] == 0 && hdr[2] == 0 && hdr[3] == 0)
+      saw_all_zero = hdr[0] == 0 && hdr[1] == 0 && hdr[2] == 0 && hdr[3] == 0;
+      saw_all_ff = hdr[0] == 0xff && hdr[1] == 0xff && hdr[2] == 0xff && hdr[3] == 0xff;
+
+      if (!saw_all_zero && !saw_all_ff)
+        break;
+
+      if (attempt + 1 == 4)
+        break;
+
+      fp_dbg ("gdix51c0: SPI read saw idle %s header, retrying",
+              saw_all_ff ? "all-FF" : "all-zero");
+      g_usleep (5000 + attempt * 10000);
+    }
+
+  if (saw_all_zero)
     {
       g_set_error_literal (error,
                            G_IO_ERROR,
@@ -177,7 +195,7 @@ gdix51c0_spi_read (FpDevice *dev, int spi_fd, gsize *out_len, GError **error)
 
   guint16 length = (guint16) hdr[1] | ((guint16) hdr[2] << 8);
 
-  if (length == 0xffff)
+  if (saw_all_ff || length == 0xffff)
     {
       g_set_error_literal (error,
                            G_IO_ERROR,
@@ -213,7 +231,7 @@ gdix51c0_spi_read (FpDevice *dev, int spi_fd, gsize *out_len, GError **error)
             }
         }
 
-      if (nonzero_tail)
+      if (nonzero_tail && !(tail[0] == 0xff && tail[1] == 0xff))
         {
           fp_dbg ("gdix51c0: SPI read tail guard after payload was %02x %02x",
                   tail[0],
@@ -354,6 +372,12 @@ gdix51c0_irq_wait (struct gpiod_line_request *irq_req,
 gboolean
 gdix51c0_reset_pulse (struct gpiod_chip *chip, unsigned int offset, GError **error)
 {
+  if (!chip)
+    {
+      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_CLOSED,
+                          "gdix51c0: reset requested but gpio chip is closed");
+      return FALSE;
+    }
   /* Mirror python: open the line as OUTPUT(0), write 1, sleep, write 0,
    * sleep, then RELEASE the request entirely.  The release lets the
    * kernel return the line to its default state (INPUT/high-Z), and
@@ -659,7 +683,7 @@ gdix51c0_cmd_ack_optional_resp (Gdix51c0Bus *bus,
       g_autoptr(GError) local_error = NULL;
       if (!gdix51c0_read_and_drop (bus, label, &local_error))
         {
-          fp_warn ("gdix51c0: %s optional response read failed: %s",
+          fp_dbg ("gdix51c0: %s optional response read failed: %s",
                    label,
                    local_error ? local_error->message : "?");
           return TRUE;
@@ -771,4 +795,45 @@ gdix51c0_irq_wait_edge_strict (struct gpiod_line_request *irq_req,
     }
 
   return FALSE;
+}
+
+guint8 *
+gdix51c0_cmd_single_resp_level (Gdix51c0Bus *bus,
+                                const guint8 *payload,
+                                gsize len,
+                                guint timeout_usec,
+                                gsize *out_len,
+                                const char *label,
+                                GError **error)
+{
+  fp_dbg ("gdix51c0: %s (single response level-wait, %zu B)", label, len);
+
+  g_usleep (20000);
+  gdix51c0_irq_drain (bus->irq_req, bus->irq_events);
+
+  if (!gdix51c0_spi_write (bus->dev, bus->spi_fd,
+                           GDIX51C0_PKT_WRITE, payload, len, error))
+    return NULL;
+
+  if (!gdix51c0_irq_wait (bus->irq_req, bus->irq_events, TRUE,
+                          bus->irq_offset, timeout_usec,
+                          label, error))
+    return NULL;
+
+  guint8 *buf = gdix51c0_spi_read (bus->dev, bus->spi_fd, out_len, error);
+  if (!buf)
+    return NULL;
+
+  if (!gdix51c0_irq_wait (bus->irq_req, bus->irq_events, FALSE,
+                          bus->irq_offset, timeout_usec,
+                          label, error))
+    {
+      g_free (buf);
+      return NULL;
+    }
+
+  fp_dbg ("gdix51c0: %s single response read %zu B",
+          label, out_len ? *out_len : 0);
+
+  return buf;
 }

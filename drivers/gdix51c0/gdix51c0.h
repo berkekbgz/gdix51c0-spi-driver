@@ -35,9 +35,14 @@ G_DECLARE_FINAL_TYPE (FpiDeviceGdix51c0, fpi_device_gdix51c0, FPI, DEVICE_GDIX51
 /* Raw SIGFM enrollment/matching.  We store native 64x80 8-bit frames in
  * FPI_PRINT_RAW templates and match them with SIFT instead of NBIS minutiae. */
 #define GDIX51C0_ENROLL_SAMPLES       10
-#define GDIX51C0_SIGFM_THRESHOLD      5
-#define GDIX51C0_SIGFM_BEST_MIN       10
-#define GDIX51C0_SIGFM_MIN_SAMPLES    2
+
+#define GDIX51C0_SIGFM_TEMPLATE_KP_MIN  60
+#define GDIX51C0_SIGFM_PROBE_KP_MIN     60
+
+#define GDIX51C0_SIGFM_SCORE_WEAK       20
+#define GDIX51C0_SIGFM_SCORE_MEDIUM     35
+#define GDIX51C0_SIGFM_SCORE_STRONG     120
+#define GDIX51C0_SIGFM_SCORE_VERY_STRONG 300
 
 /* GPIO defaults — match protocol_interaction.py. The proper fix is to
  * resolve the IRQ line from the ACPI _CRS, but for our laptop these
@@ -69,6 +74,8 @@ G_DECLARE_FINAL_TYPE (FpiDeviceGdix51c0, fpi_device_gdix51c0, FPI, DEVICE_GDIX51
 
 #define GDIX51C0_BOOT_TIMEOUT_USEC    (3   * 1000 * 1000)
 #define GDIX51C0_FDT_TIMEOUT_USEC     (3   * 1000 * 1000)
+#define GDIX51C0_FDT_ACK_TIMEOUT_USEC (1   * 1000 * 1000)
+#define GDIX51C0_IMAGE_ACK_TIMEOUT_USEC (250 * 1000)
 #define GDIX51C0_IMAGE_TIMEOUT_USEC   (10  * 1000 * 1000)
 #define GDIX51C0_FINGER_TIMEOUT_USEC  (60  * 1000 * 1000)
 
