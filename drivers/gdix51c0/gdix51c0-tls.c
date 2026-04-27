@@ -107,14 +107,39 @@ gdix51c0_bio_read (BIO *b, char *buf, int len)
           return -1;
         }
 
-      gsize plen = 0;
-      guint8 *pkt = gdix51c0_spi_read (tls->dev, tls->spi_fd, &plen, &error);
-      if (!pkt)
-        {
-          fp_warn ("gdix51c0: tls bio spi_read: %s", error ? error->message : "?");
-          g_clear_error (&error);
-          return -1;
-        }
+        gsize plen = 0;
+        guint8 *pkt = gdix51c0_spi_read (tls->dev, tls->spi_fd, &plen, &error);
+        if (!pkt)
+          {
+            fp_warn ("gdix51c0: tls bio spi_read first attempt: %s",
+                    error ? error->message : "?");
+            g_clear_error (&error);
+
+            gdix51c0_irq_drain (tls->irq_req, tls->irq_events);
+
+            if (!gdix51c0_irq_wait (tls->irq_req,
+                                    tls->irq_events,
+                                    TRUE,
+                                    tls->irq_offset,
+                                    GDIX51C0_BOOT_TIMEOUT_USEC,
+                                    "tls-read-rise-retry",
+                                    &error))
+              {
+                fp_warn ("gdix51c0: tls bio retry rise: %s",
+                        error ? error->message : "?");
+                g_clear_error (&error);
+                return -1;
+              }
+
+            pkt = gdix51c0_spi_read (tls->dev, tls->spi_fd, &plen, &error);
+            if (!pkt)
+              {
+                fp_warn ("gdix51c0: tls bio spi_read retry failed: %s",
+                        error ? error->message : "?");
+                g_clear_error (&error);
+                return -1;
+              }
+          }
 
       gdix51c0_irq_wait (tls->irq_req, tls->irq_events, FALSE,
                       tls->irq_offset, GDIX51C0_BOOT_TIMEOUT_USEC,
@@ -287,14 +312,34 @@ gdix51c0_tls_init (Gdix51c0Tls *tls,
 gboolean
 gdix51c0_tls_handshake (Gdix51c0Tls *tls, GError **error)
 {
-  /* Kick the MCU to start its ClientHello. */
-  static const guint8 d1_payload[] = { 0xd1, 0x03, 0x00, 0x00, 0x00, 0xd7 };
-  if (!gdix51c0_spi_write (tls->dev, tls->spi_fd, GDIX51C0_PKT_WRITE,
-                        d1_payload, sizeof (d1_payload), error))
+  /*
+   * Kick the MCU to start TLS. Important:
+   *
+   * Do NOT use gdix51c0_cmd_ack(), gdix51c0_cmd_ack_optional_resp(), or
+   * gdix51c0_cmd_ack_then_resp() here.
+   *
+   * The packet that arrives after 0xd1 is not a normal Goodix ACK in your
+   * trace; it was 52 bytes, which is consistent with TLS handshake data.
+   * If we read it here, OpenSSL never sees it and SSL_accept later times out.
+   */
+  static const guint8 d1_payload[] = {
+    0xd1, 0x03, 0x00, 0x00, 0x00, 0xd7
+  };
+
+  gdix51c0_irq_drain (tls->irq_req, tls->irq_events);
+
+  if (!gdix51c0_spi_write (tls->dev,
+                           tls->spi_fd,
+                           GDIX51C0_PKT_WRITE,
+                           d1_payload,
+                           sizeof (d1_payload),
+                           error))
     return FALSE;
 
-  /* Drive accept until done.  The custom BIO blocks on IRQ, so a single
-   * SSL_accept call should run the whole handshake to completion. */
+  /*
+   * Now let OpenSSL drive the protocol. The first call into BIO_read will
+   * wait for IRQ high and read the 52-byte packet itself.
+   */
   int rc = SSL_accept (tls->ssl);
   if (rc <= 0)
     {
@@ -303,19 +348,71 @@ gdix51c0_tls_handshake (Gdix51c0Tls *tls, GError **error)
       fp_warn ("gdix51c0: SSL_accept rc=%d ssl_err=%d", rc, ssl_err);
       return FALSE;
     }
+
   fp_dbg ("gdix51c0: TLS handshake complete (cipher=%s)",
           SSL_get_cipher (tls->ssl));
+
+  g_free (tls->rd_buf);
+  tls->rd_buf = NULL;
+  tls->rd_off = 0;
+  tls->rd_len = 0;
+  gdix51c0_irq_drain (tls->irq_req, tls->irq_events);
+
+  return TRUE;
+}
+
+gboolean
+gdix51c0_tls_record_header_ok (const guint8 *record, gsize record_len)
+{
+  if (!record || record_len < 5)
+    return FALSE;
+
+  /* TLS record content types used here:
+   * 0x14 ChangeCipherSpec
+   * 0x15 Alert
+   * 0x16 Handshake
+   * 0x17 ApplicationData
+   */
+  if (record[0] != 0x14 &&
+      record[0] != 0x15 &&
+      record[0] != 0x16 &&
+      record[0] != 0x17)
+    return FALSE;
+
+  if (record[1] != 0x03)
+    return FALSE;
+
+  guint16 tls_len = ((guint16) record[3] << 8) | record[4];
+
+  if ((gsize) tls_len + 5 > record_len)
+    return FALSE;
+
   return TRUE;
 }
 
 guint8 *
 gdix51c0_tls_decrypt_record (Gdix51c0Tls *tls,
-                          const guint8 *record, gsize record_len,
-                          gsize *out_len, GError **error)
+                             const guint8 *record,
+                             gsize record_len,
+                             gsize *out_len,
+                             GError **error)
 {
-  /* Splice the encrypted record into our read buffer and pull plaintext
-   * via SSL_read.  TLS app records on this MCU are <16 KiB so a single
-   * SSL_read call is enough. */
+  if (!gdix51c0_tls_record_header_ok (record, record_len))
+    {
+      GString *s = g_string_new (NULL);
+      gsize dump_len = MIN (record_len, (gsize) 32);
+
+      for (gsize i = 0; i < dump_len; i++)
+        g_string_append_printf (s, "%02x", record[i]);
+
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                   "gdix51c0: not a TLS record len=%zu first=%s",
+                   record_len, s->str);
+
+      g_string_free (s, TRUE);
+      return NULL;
+    }
+
   g_free (tls->rd_buf);
   tls->rd_buf = g_memdup2 (record, record_len);
   tls->rd_off = 0;
@@ -323,14 +420,22 @@ gdix51c0_tls_decrypt_record (Gdix51c0Tls *tls,
 
   guint8 *plain = g_malloc (record_len);
   int n = SSL_read (tls->ssl, plain, (int) record_len);
+
   if (n <= 0)
     {
+      int ssl_err = SSL_get_error (tls->ssl, n);
       g_free (plain);
-      g_propagate_error (error, gdix51c0_openssl_error ("SSL_read"));
+
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                   "gdix51c0: SSL_read failed ssl_err=%d openssl=%s",
+                   ssl_err,
+                   ERR_error_string (ERR_get_error (), NULL));
       return NULL;
     }
+
   if (out_len)
     *out_len = (gsize) n;
+
   return plain;
 }
 

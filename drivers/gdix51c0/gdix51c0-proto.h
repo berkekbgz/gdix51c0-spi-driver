@@ -130,4 +130,31 @@ guint8 *gdix51c0_cmd_read (Gdix51c0Bus *bus, const guint8 *payload, gsize len,
                         guint timeout_usec, gsize *out_len,
                         const char *label, GError **error);
 
+guint8 *
+gdix51c0_cmd_single_resp (Gdix51c0Bus *bus,
+                          const guint8 *payload,
+                          gsize len,
+                          guint timeout_usec,
+                          gsize *out_len,
+                          const char *label,
+                          GError **error);
+
 G_END_DECLS
+
+gboolean
+gdix51c0_cmd_ack_optional_resp (Gdix51c0Bus *bus,
+                                const guint8 *payload,
+                                gsize len,
+                                guint optional_timeout_usec,
+                                const char *label,
+                                GError **error);
+
+
+gboolean
+gdix51c0_irq_wait_edge_strict (struct gpiod_line_request *irq_req,
+                               struct gpiod_edge_event_buffer *event_buf,
+                               gboolean target_high,
+                               unsigned int irq_offset,
+                               guint timeout_usec,
+                               const char *label,
+                               GError **error);

@@ -61,6 +61,9 @@ guint8 *gdix51c0_tls_decrypt_record (Gdix51c0Tls *tls,
                                   const guint8 *record, gsize record_len,
                                   gsize *out_len, GError **error);
 
+gboolean
+gdix51c0_tls_record_header_ok (const guint8 *record, gsize record_len);
+
 void     gdix51c0_tls_free (Gdix51c0Tls *tls);
 
 G_END_DECLS
