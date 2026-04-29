@@ -5,6 +5,7 @@
 #include "binary.hpp"
 #include "img-info.hpp"
 
+#include <opencv2/calib3d.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/features2d.hpp>
 #include <opencv2/imgproc.hpp>
@@ -13,8 +14,6 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
-#include <set>
-#include <tuple>
 #include <vector>
 
 namespace bin {
@@ -38,29 +37,14 @@ struct deserializer<SigfmImgInfo> : public std::true_type {
 } // namespace bin
 
 namespace {
-constexpr double distance_match = 0.85;
-constexpr double length_match = 0.05;
-constexpr double angle_match = 0.05;
-constexpr int min_match = 5;
+constexpr double distance_match = 0.70;
+constexpr int min_match = 8;
+constexpr double min_inlier_ratio = 0.35;
+constexpr double ransac_reproj_threshold = 3.0;
+constexpr double max_rotation_degrees = 35.0;
+constexpr double min_scale = 0.65;
+constexpr double max_scale = 1.55;
 constexpr double pi = 3.14159265358979323846;
-
-struct match {
-  cv::Point2i p1;
-  cv::Point2i p2;
-
-  match (cv::Point2i ip1, cv::Point2i ip2) : p1 { ip1 }, p2 { ip2 } {}
-
-  bool operator< (const match &right) const
-  {
-    return std::tie (p1.y, p1.x, p2.y, p2.x) <
-           std::tie (right.p1.y, right.p1.x, right.p2.y, right.p2.x);
-  }
-};
-
-struct angle_pair {
-  double cos;
-  double sin;
-};
 } // namespace
 
 SigfmImgInfo *
@@ -133,11 +117,14 @@ sigfm_match_score (SigfmImgInfo *frame, SigfmImgInfo *enrolled)
 
   try
     {
+      auto matcher = cv::BFMatcher::create ();
       std::vector<std::vector<cv::DMatch>> points;
-      cv::BFMatcher::create ()->knnMatch (frame->descriptors, enrolled->descriptors, points, 2);
+      std::vector<std::vector<cv::DMatch>> reverse_points;
+      matcher->knnMatch (frame->descriptors, enrolled->descriptors, points, 2);
+      matcher->knnMatch (enrolled->descriptors, frame->descriptors, reverse_points, 2);
 
-      std::set<match> unique_matches;
-      for (const auto &pair : points)
+      std::vector<int> reverse_best (enrolled->descriptors.rows, -1);
+      for (const auto &pair : reverse_points)
         {
           if (pair.size () < 2)
             continue;
@@ -145,56 +132,85 @@ sigfm_match_score (SigfmImgInfo *frame, SigfmImgInfo *enrolled)
           const cv::DMatch &first = pair[0];
           const cv::DMatch &second = pair[1];
           if (first.distance < distance_match * second.distance)
-            unique_matches.emplace (frame->keypoints[first.queryIdx].pt,
-                                    enrolled->keypoints[first.trainIdx].pt);
+            reverse_best[first.queryIdx] = first.trainIdx;
+        }
+
+      std::vector<cv::DMatch> ratio_matches;
+      for (const auto &pair : points)
+        {
+          if (pair.size () < 2)
+            continue;
+
+          const cv::DMatch &first = pair[0];
+          const cv::DMatch &second = pair[1];
+          if (first.distance < distance_match * second.distance &&
+              reverse_best[first.trainIdx] == first.queryIdx)
+            ratio_matches.push_back (first);
+        }
+
+      if (ratio_matches.size () < min_match)
+        return 0;
+
+      std::sort (ratio_matches.begin (), ratio_matches.end (),
+                 [] (const cv::DMatch &a, const cv::DMatch &b) {
+                   return a.distance < b.distance;
+                 });
+
+      std::vector<cv::DMatch> unique_matches;
+      std::vector<bool> used_query (frame->keypoints.size (), false);
+      std::vector<bool> used_train (enrolled->keypoints.size (), false);
+
+      for (const auto &match : ratio_matches)
+        {
+          if (used_query[match.queryIdx] || used_train[match.trainIdx])
+            continue;
+
+          used_query[match.queryIdx] = true;
+          used_train[match.trainIdx] = true;
+          unique_matches.push_back (match);
         }
 
       if (unique_matches.size () < min_match)
         return 0;
 
-      std::vector<match> matches { unique_matches.begin (), unique_matches.end () };
-      std::vector<angle_pair> angles;
+      std::vector<cv::Point2f> frame_points;
+      std::vector<cv::Point2f> enrolled_points;
 
-      for (std::size_t j = 0; j < matches.size (); j++)
+      for (const auto &match : unique_matches)
         {
-          for (std::size_t k = j + 1; k < matches.size (); k++)
-            {
-              const match &a = matches[j];
-              const match &b = matches[k];
-              double v1x = a.p1.x - b.p1.x;
-              double v1y = a.p1.y - b.p1.y;
-              double v2x = a.p2.x - b.p2.x;
-              double v2y = a.p2.y - b.p2.y;
-              double len1 = std::sqrt (v1x * v1x + v1y * v1y);
-              double len2 = std::sqrt (v2x * v2x + v2y * v2y);
-
-              if (len1 <= 0 || len2 <= 0)
-                continue;
-              if (1.0 - std::min (len1, len2) / std::max (len1, len2) > length_match)
-                continue;
-
-              double product = len1 * len2;
-              double dot = std::clamp ((v1x * v2x + v1y * v2y) / product, -1.0, 1.0);
-              double cross = std::clamp ((v1x * v2y - v1y * v2x) / product, -1.0, 1.0);
-              angles.push_back ({ std::acos (cross), pi / 2.0 + std::asin (dot) });
-            }
+          frame_points.push_back (frame->keypoints[match.queryIdx].pt);
+          enrolled_points.push_back (enrolled->keypoints[match.trainIdx].pt);
         }
 
-      if (angles.size () < min_match)
+      cv::Mat inliers;
+      cv::Mat affine = cv::estimateAffinePartial2D (frame_points,
+                                                    enrolled_points,
+                                                    inliers,
+                                                    cv::RANSAC,
+                                                     ransac_reproj_threshold,
+                                                    2000,
+                                                    0.995,
+                                                    10);
+      if (affine.empty () || inliers.empty ())
         return 0;
 
-      int count = 0;
-      for (std::size_t j = 0; j < angles.size (); j++)
-        {
-          for (std::size_t k = j + 1; k < angles.size (); k++)
-            {
-              const angle_pair &a = angles[j];
-              const angle_pair &b = angles[k];
-              if (1.0 - std::min (a.sin, b.sin) / std::max (a.sin, b.sin) <= angle_match &&
-                  1.0 - std::min (a.cos, b.cos) / std::max (a.cos, b.cos) <= angle_match)
-                count++;
-            }
-        }
+      cv::Mat affine64;
+      affine.convertTo (affine64, CV_64F);
+
+      double a = affine64.at<double> (0, 0);
+      double b = affine64.at<double> (1, 0);
+      double scale = std::sqrt (a * a + b * b);
+      double rotation = std::abs (std::atan2 (b, a) * 180.0 / pi);
+
+      if (scale < min_scale || scale > max_scale || rotation > max_rotation_degrees)
+        return 0;
+
+      int count = cv::countNonZero (inliers);
+      if (count < min_match)
+        return 0;
+
+      if (static_cast<double> (count) / static_cast<double> (unique_matches.size ()) < min_inlier_ratio)
+        return 0;
 
       return count;
     }

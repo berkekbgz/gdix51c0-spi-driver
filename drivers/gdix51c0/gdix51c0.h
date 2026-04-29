@@ -34,15 +34,14 @@ G_DECLARE_FINAL_TYPE (FpiDeviceGdix51c0, fpi_device_gdix51c0, FPI, DEVICE_GDIX51
 
 /* Raw SIGFM enrollment/matching.  We store native 64x80 8-bit frames in
  * FPI_PRINT_RAW templates and match them with SIFT instead of NBIS minutiae. */
-#define GDIX51C0_ENROLL_SAMPLES       10
+#define GDIX51C0_ENROLL_SAMPLES       12
 
-#define GDIX51C0_SIGFM_TEMPLATE_KP_MIN  60
-#define GDIX51C0_SIGFM_PROBE_KP_MIN     60
+#define GDIX51C0_SIGFM_TEMPLATE_KP_MIN  40
+#define GDIX51C0_SIGFM_PROBE_KP_MIN     40
 
-#define GDIX51C0_SIGFM_SCORE_WEAK       20
-#define GDIX51C0_SIGFM_SCORE_MEDIUM     35
-#define GDIX51C0_SIGFM_SCORE_STRONG     120
-#define GDIX51C0_SIGFM_SCORE_VERY_STRONG 300
+#define GDIX51C0_SIGFM_SCORE_WEAK       8
+#define GDIX51C0_SIGFM_SCORE_MEDIUM     10
+#define GDIX51C0_SIGFM_SCORE_STRONG     14
 
 /* GPIO defaults — match protocol_interaction.py. The proper fix is to
  * resolve the IRQ line from the ACPI _CRS, but for our laptop these
