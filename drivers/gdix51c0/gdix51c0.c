@@ -52,14 +52,22 @@ struct _FpiDeviceGdix51c0
   guint8                     fdt_down_regs[12];
   guint16                    fdt_down_sample[6];
   gboolean                   fdt_down_sample_valid;
+  gboolean                   require_lift_gap;
 };
 
 G_DEFINE_TYPE (FpiDeviceGdix51c0, fpi_device_gdix51c0, FP_TYPE_DEVICE);
 
 #define GDIX51C0_TOUCH_IGNORE 0xff
-#define GDIX51C0_FDT_HOST_TOUCH_MIN_DROP 25
-#define GDIX51C0_FDT_HOST_TOUCH_TOTAL_DROP 70
 #define GDIX51C0_VERIFY_CAPTURE_ATTEMPTS 3
+#define GDIX51C0_FDT_UP_THRESHOLD_OFFSET 29
+/* Minimum time to wait for an armed FDT-up event to fire so we can drain it.
+ * The device typically fires ~70 ms after arming; if we abandon the read
+ * earlier the response stays parked on the SPI bus and the next FDT-down arm
+ * fails on a stuck-high IRQ. */
+#define GDIX51C0_FDT_UP_DRAIN_USEC      (300 * 1000)
+#define GDIX51C0_ENROLL_LIFT_TIMEOUT_USEC (2 * 1000 * 1000)
+#define GDIX51C0_LIFT_CLEANUP_TIMEOUT_USEC (5 * 1000 * 1000)
+#define GDIX51C0_NAV_RESPONSE_LEN 2413
 
 static const guint8 gdix51c0_default_fdt_down_regs[12] = {
   0x80, 0xad, 0x80, 0xbb, 0x80, 0xa2,
@@ -523,6 +531,7 @@ gdix51c0_session_activate_once (FpiDeviceGdix51c0 *self, GError **error)
 
   self->session_desynced = FALSE;
   self->fdt_down_sample_valid = FALSE;
+  self->require_lift_gap = FALSE;
   memcpy (self->fdt_down_regs,
           gdix51c0_default_fdt_down_regs,
           sizeof (self->fdt_down_regs));
@@ -701,25 +710,105 @@ gdix51c0_wait_irq_level (FpiDeviceGdix51c0 *self,
                             self->irq_offset, timeout_usec, label, error);
 }
 
-/* ------------------------------------------------------------------ */
-/* One round of FDT-down (cmd 0x32): write setmode, read ack, read     */
-/* response.  Sets *touchflag to response byte [5] (0x3f when finger    */
-/* present, 0x00 when not).  Used by the finger-detection poll.         */
-/* ------------------------------------------------------------------ */
 static gboolean
-gdix51c0_fdt_down_round (FpiDeviceGdix51c0 *self,
-                         guint              finger_timeout_usec,
-                         guint8            *touchflag,
-                         gboolean          *retry,
-                         GError           **error)
+gdix51c0_wait_fdt_rise (FpiDeviceGdix51c0 *self,
+                        guint              timeout_usec,
+                        const char        *label,
+                        GError           **error)
+{
+  gint64 deadline = g_get_monotonic_time () + (gint64) timeout_usec;
+  enum gpiod_line_value value;
+
+  value = gpiod_line_request_get_value (self->irq_req, self->irq_offset);
+  if (value < 0)
+    {
+      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+                   "gdix51c0: %s: get IRQ value failed", label);
+      return FALSE;
+    }
+
+  if (value == GPIOD_LINE_VALUE_ACTIVE)
+    return TRUE;
+
+  gdix51c0_irq_drain (self->irq_req, self->irq_events);
+
+  value = gpiod_line_request_get_value (self->irq_req, self->irq_offset);
+  if (value < 0)
+    {
+      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+                   "gdix51c0: %s: get IRQ value failed", label);
+      return FALSE;
+    }
+
+  if (value == GPIOD_LINE_VALUE_ACTIVE)
+    return TRUE;
+
+  for (;;)
+    {
+      gint64 now = g_get_monotonic_time ();
+
+      if (now >= deadline)
+        break;
+
+      int ready =
+        gpiod_line_request_wait_edge_events (self->irq_req,
+                                             (deadline - now) * 1000);
+
+      if (ready < 0)
+        {
+          g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+                       "gdix51c0: %s: wait_edge_events failed", label);
+          return FALSE;
+        }
+
+      if (ready == 0)
+        break;
+
+      int n = gpiod_line_request_read_edge_events (self->irq_req,
+                                                   self->irq_events,
+                                                   16);
+      if (n < 0)
+        {
+          g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+                       "gdix51c0: %s: read_edge_events failed", label);
+          return FALSE;
+        }
+
+      for (int i = 0; i < n; i++)
+        {
+          struct gpiod_edge_event *ev =
+            gpiod_edge_event_buffer_get_event (self->irq_events, i);
+
+          if (ev &&
+              gpiod_edge_event_get_event_type (ev) == GPIOD_EDGE_EVENT_RISING_EDGE)
+            return TRUE;
+        }
+    }
+
+  value = gpiod_line_request_get_value (self->irq_req, self->irq_offset);
+  if (value >= 0)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
+                   "gdix51c0: %s: IRQ never went high; final level=%s",
+                   label,
+                   value == GPIOD_LINE_VALUE_ACTIVE ? "high" : "low");
+    }
+  else
+    {
+      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+                   "gdix51c0: %s: get final IRQ value failed", label);
+    }
+
+  return FALSE;
+}
+
+static gboolean
+gdix51c0_fdt_down_arm (FpiDeviceGdix51c0 *self,
+                       GError           **error)
 {
   guint8 fdt_data[2 + 12 + 2];
   gsize fdt_pkt_len = 0;
   g_autofree guint8 *fdt_packet = NULL;
-  g_autoptr(GError) local_error = NULL;
-
-  *touchflag = 0;
-  *retry = FALSE;
 
   fdt_data[0] = 0x08;
   fdt_data[1] = 0x01;
@@ -738,11 +827,8 @@ gdix51c0_fdt_down_round (FpiDeviceGdix51c0 *self,
   g_usleep (80000);
 
   if (!gdix51c0_wait_irq_level (self, FALSE, GDIX51C0_FDT_ACK_TIMEOUT_USEC,
-                                "fdt-pre-idle", &local_error))
-    {
-      *retry = TRUE;
-      return TRUE;
-    }
+                                "fdt-down-pre-idle", error))
+    return FALSE;
 
   gdix51c0_irq_drain (self->irq_req, self->irq_events);
 
@@ -752,52 +838,45 @@ gdix51c0_fdt_down_round (FpiDeviceGdix51c0 *self,
 
   if (!gdix51c0_irq_wait (self->irq_req, self->irq_events, TRUE,
                           self->irq_offset, GDIX51C0_FDT_ACK_TIMEOUT_USEC,
-                          "fdt-down-ack-rise", &local_error))
-    {
-      fp_dbg ("gdix51c0: FDT arm got no ACK; retrying");
-      *retry = TRUE;
-      return TRUE;
-    }
+                          "fdt-down-ack-rise", error))
+    return FALSE;
 
   {
     gsize n = 0;
     g_autofree guint8 *ack =
-      gdix51c0_spi_read (FP_DEVICE (self), self->spi_fd, &n, &local_error);
+      gdix51c0_spi_read (FP_DEVICE (self), self->spi_fd, &n, error);
 
     if (!ack)
-      {
-        fp_dbg ("gdix51c0: FDT ACK read failed: %s; retrying",
-                local_error ? local_error->message : "?");
-        *retry = TRUE;
-        return TRUE;
-      }
+      return FALSE;
   }
 
   if (!gdix51c0_irq_wait (self->irq_req, self->irq_events, FALSE,
                           self->irq_offset, GDIX51C0_FDT_ACK_TIMEOUT_USEC,
-                          "fdt-down-ack-fall", &local_error))
-    {
-      *retry = TRUE;
-      return TRUE;
-    }
+                          "fdt-down-ack-fall", error))
+    return FALSE;
 
-  if (!gdix51c0_irq_wait (self->irq_req, self->irq_events, TRUE,
-                          self->irq_offset, finger_timeout_usec,
-                          "fdt-down-finger-rise", error))
+  return TRUE;
+}
+
+static gboolean
+gdix51c0_fdt_down_read (FpiDeviceGdix51c0 *self,
+                        guint              finger_timeout_usec,
+                        guint8            *touchflag,
+                        GError           **error)
+{
+  *touchflag = 0;
+
+  if (!gdix51c0_wait_fdt_rise (self, finger_timeout_usec,
+                               "fdt-down-finger-rise", error))
     return FALSE;
 
   {
     gsize n = 0;
     g_autofree guint8 *fdt_resp =
-      gdix51c0_spi_read (FP_DEVICE (self), self->spi_fd, &n, &local_error);
+      gdix51c0_spi_read (FP_DEVICE (self), self->spi_fd, &n, error);
 
     if (!fdt_resp)
-      {
-        fp_dbg ("gdix51c0: FDT response read failed: %s; retrying",
-                local_error ? local_error->message : "?");
-        *retry = TRUE;
-        return TRUE;
-      }
+      return FALSE;
 
     {
       guint16 inner_len = n >= 3 ? ((guint16) fdt_resp[1] | ((guint16) fdt_resp[2] << 8)) : 0;
@@ -824,19 +903,20 @@ gdix51c0_fdt_down_round (FpiDeviceGdix51c0 *self,
                 n > 0 ? fdt_resp[0] : 0,
                 n > 0 ? fdt_resp[n - 1] : 0);
         *touchflag = GDIX51C0_TOUCH_IGNORE;
-        return TRUE;
       }
-
-    *touchflag = (n > 5) ? fdt_resp[5] : 0;
-
-    self->fdt_down_sample_valid = FALSE;
-    if (n >= 20)
+    else
       {
-        for (guint i = 0; i < 6; i++)
-          self->fdt_down_sample[i] = (guint16) fdt_resp[7 + i * 2] |
-                                     ((guint16) fdt_resp[8 + i * 2] << 8);
+        *touchflag = (n > 5) ? fdt_resp[5] : 0;
 
-        self->fdt_down_sample_valid = TRUE;
+        self->fdt_down_sample_valid = FALSE;
+        if (n >= 20)
+          {
+            for (guint i = 0; i < 6; i++)
+              self->fdt_down_sample[i] = (guint16) fdt_resp[7 + i * 2] |
+                                         ((guint16) fdt_resp[8 + i * 2] << 8);
+
+            self->fdt_down_sample_valid = TRUE;
+          }
       }
 
     /* Windows derives the next FDT-down base from an FDT-up response.  Do not
@@ -846,37 +926,81 @@ gdix51c0_fdt_down_round (FpiDeviceGdix51c0 *self,
 
   if (!gdix51c0_irq_wait (self->irq_req, self->irq_events, FALSE,
                           self->irq_offset, GDIX51C0_FDT_ACK_TIMEOUT_USEC,
-                          "fdt-down-finger-fall", &local_error))
-    {
-      *retry = TRUE;
-      return TRUE;
-    }
+                          "fdt-down-finger-fall", error))
+    return FALSE;
 
   return TRUE;
 }
 
 static gboolean
-gdix51c0_fdt_manual_round (FpiDeviceGdix51c0 *self,
-                           guint8            *touchflag,
-                           GError           **error)
+gdix51c0_parse_fdt_up_response (FpiDeviceGdix51c0 *self,
+                                const guint8      *fdt_resp,
+                                gsize              n,
+                                guint8            *touchflag,
+                                GError           **error)
+{
+  if (n < 17 || fdt_resp[0] != GDIX51C0_CMD_FDT_UP)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                   "gdix51c0: invalid FDT-up response len=%zu cmd=0x%02x",
+                   n, n > 0 ? fdt_resp[0] : 0);
+      return FALSE;
+    }
+
+  *touchflag = (n > 5) ? fdt_resp[5] : 0xff;
+
+  /* Do NOT retune fdt_down_regs from the FDT-up response.  The Windows
+   * formula (lift_sample / 2 truncated to a byte) puts the threshold byte
+   * around 0xCD on this sensor, which is only ~5 below the touched byte
+   * (~0xd2) and ~50 above the rest byte (~0x9a) — too tight to separate
+   * states reliably, so the device returns nothing but zero-touch events.
+   * The static defaults (0xad..0xbb) sit cleanly between rest and touch
+   * and detect press correctly. */
+
+  {
+    GString *s = g_string_sized_new (n * 3 + 1);
+    for (gsize i = 0; i < n; i++)
+      g_string_append_printf (s, "%02x%s", fdt_resp[i], i + 1 < n ? " " : "");
+    fp_dbg ("gdix51c0: FDT-up response len=%zu touchflag=0x%02x data=%s",
+            n, *touchflag, s->str);
+    g_string_free (s, TRUE);
+  }
+  return TRUE;
+}
+
+static gboolean
+gdix51c0_fdt_up_arm (FpiDeviceGdix51c0 *self,
+                     GError           **error)
 {
   guint8 fdt_data[2 + 12];
   gsize fdt_pkt_len = 0;
   g_autofree guint8 *fdt_packet = NULL;
 
-  *touchflag = 0;
-
   fdt_data[0] = 0x08;
-  fdt_data[1] = 0x03;
-  memcpy (&fdt_data[2], self->fdt_down_regs, sizeof (self->fdt_down_regs));
+  fdt_data[1] = 0x02;
+  if (!self->fdt_down_sample_valid)
+    {
+      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                           "gdix51c0: FDT-up requested without FDT-down sample");
+      return FALSE;
+    }
+
+  for (guint i = 0; i < 6; i++)
+    {
+      guint threshold = self->fdt_down_sample[i] / 2 +
+                        GDIX51C0_FDT_UP_THRESHOLD_OFFSET;
+
+      fdt_data[2 + i * 2] = 0x80;
+      fdt_data[3 + i * 2] = (guint8) MIN (threshold, 0xff);
+    }
 
   fdt_packet =
-    gdix51c0_make_payload_packet (GDIX51C0_CMD_FDT_MANUAL,
+    gdix51c0_make_payload_packet (GDIX51C0_CMD_FDT_UP,
                                   fdt_data, sizeof (fdt_data),
                                   &fdt_pkt_len);
 
   if (!gdix51c0_wait_irq_level (self, FALSE, GDIX51C0_FDT_ACK_TIMEOUT_USEC,
-                                "fdt-manual-pre-idle", error))
+                                "fdt-up-pre-idle", error))
     return FALSE;
 
   gdix51c0_irq_drain (self->irq_req, self->irq_events);
@@ -887,7 +1011,7 @@ gdix51c0_fdt_manual_round (FpiDeviceGdix51c0 *self,
 
   if (!gdix51c0_irq_wait (self->irq_req, self->irq_events, TRUE,
                           self->irq_offset, GDIX51C0_FDT_ACK_TIMEOUT_USEC,
-                          "fdt-manual-ack-rise", error))
+                          "fdt-up-ack-rise", error))
     return FALSE;
 
   {
@@ -901,12 +1025,27 @@ gdix51c0_fdt_manual_round (FpiDeviceGdix51c0 *self,
 
   if (!gdix51c0_irq_wait (self->irq_req, self->irq_events, FALSE,
                           self->irq_offset, GDIX51C0_FDT_ACK_TIMEOUT_USEC,
-                          "fdt-manual-ack-fall", error))
+                          "fdt-up-ack-fall", error))
     return FALSE;
 
-  if (!gdix51c0_irq_wait (self->irq_req, self->irq_events, TRUE,
-                          self->irq_offset, GDIX51C0_FDT_ACK_TIMEOUT_USEC,
-                          "fdt-manual-rise", error))
+  return TRUE;
+}
+
+static gboolean
+gdix51c0_fdt_up_read (FpiDeviceGdix51c0 *self,
+                      guint              lift_timeout_usec,
+                      guint8            *touchflag,
+                      GError           **error)
+{
+  *touchflag = 0xff;
+
+  if (!gdix51c0_irq_wait_edge_strict (self->irq_req,
+                                      self->irq_events,
+                                      TRUE,
+                                      self->irq_offset,
+                                      lift_timeout_usec,
+                                      "fdt-up-lift-rise",
+                                      error))
     return FALSE;
 
   {
@@ -917,20 +1056,13 @@ gdix51c0_fdt_manual_round (FpiDeviceGdix51c0 *self,
     if (!fdt_resp)
       return FALSE;
 
-    if (n < 17 || fdt_resp[0] != GDIX51C0_CMD_FDT_MANUAL)
-      {
-        g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
-                     "gdix51c0: invalid FDT manual response len=%zu cmd=0x%02x",
-                     n, n > 0 ? fdt_resp[0] : 0);
-        return FALSE;
-      }
-
-    *touchflag = (n > 5) ? fdt_resp[5] : 0;
+    if (!gdix51c0_parse_fdt_up_response (self, fdt_resp, n, touchflag, error))
+      return FALSE;
   }
 
   if (!gdix51c0_irq_wait (self->irq_req, self->irq_events, FALSE,
                           self->irq_offset, GDIX51C0_FDT_ACK_TIMEOUT_USEC,
-                          "fdt-manual-fall", error))
+                          "fdt-up-lift-fall", error))
     return FALSE;
 
   return TRUE;
@@ -944,15 +1076,16 @@ gdix51c0_wait_for_finger (FpiDeviceGdix51c0 *self, GError **error)
   guint zero_touch_count = 0;
   guint retry_count = 0;
   guint nonready_count = 0;
-  guint16 zero_base[6] = { 0 };
-  gboolean zero_base_valid = FALSE;
 
   fp_dbg ("gdix51c0: arming FDT-down and waiting for finger GPIO IRQ...");
 
+  if (!gdix51c0_fdt_down_arm (self, error))
+    return FALSE;
+
   for (;;)
     {
+      g_autoptr(GError) local_error = NULL;
       guint8 touchflag = 0;
-      gboolean retry = FALSE;
       gint64 now = g_get_monotonic_time ();
       guint remaining_usec;
 
@@ -966,28 +1099,55 @@ gdix51c0_wait_for_finger (FpiDeviceGdix51c0 *self, GError **error)
       remaining_usec = (guint) MIN (finger_deadline - now,
                                     (gint64) G_MAXUINT);
 
-      if (!gdix51c0_irq_wait (self->irq_req, self->irq_events, FALSE,
-                              self->irq_offset, GDIX51C0_FDT_TIMEOUT_USEC,
-                              "wait-finger-pre-idle", error))
-        return FALSE;
-
-      gdix51c0_irq_drain (self->irq_req, self->irq_events);
-
-      if (!gdix51c0_fdt_down_round (self, remaining_usec,
-                                    &touchflag, &retry, error))
-        return FALSE;
-
-      if (retry)
+      if (!gdix51c0_fdt_down_read (self, remaining_usec,
+                                   &touchflag, &local_error))
         {
           retry_count++;
 
-          fp_dbg ("gdix51c0: FDT retry %u; backing off", retry_count);
+          if (g_get_monotonic_time () >= finger_deadline)
+            {
+              g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
+                                   "gdix51c0: no finger detected within timeout");
+              return FALSE;
+            }
 
-          g_usleep (350000);
+          fp_dbg ("gdix51c0: FDT-down read failed; rearming (%u): %s",
+                  retry_count, local_error ? local_error->message : "?");
+
+          if (!gdix51c0_fdt_down_arm (self, error))
+            return FALSE;
+
           continue;
         }
 
       retry_count = 0;
+
+      if (touchflag == GDIX51C0_TOUCH_IGNORE)
+        {
+          fp_dbg ("gdix51c0: ignored async/non-FDT packet while waiting for finger");
+          if (!gdix51c0_fdt_down_arm (self, error))
+            return FALSE;
+          continue;
+        }
+
+      if (self->require_lift_gap)
+        {
+          if (touchflag == 0x00)
+            {
+              fp_dbg ("gdix51c0: observed zero-touch FDT gap after lift timeout");
+              self->require_lift_gap = FALSE;
+            }
+          else
+            {
+              fp_dbg ("gdix51c0: waiting for lift gap; ignoring FDT touchflag=0x%02x",
+                      touchflag);
+
+              if (!gdix51c0_fdt_down_arm (self, error))
+                return FALSE;
+
+              continue;
+            }
+        }
 
       if (touchflag == 0x3f)
         {
@@ -995,63 +1155,19 @@ gdix51c0_wait_for_finger (FpiDeviceGdix51c0 *self, GError **error)
           return TRUE;
         }
 
-      if (touchflag == GDIX51C0_TOUCH_IGNORE)
-        {
-          fp_dbg ("gdix51c0: ignored async/non-FDT packet while waiting for finger");
-          g_usleep (50000);
-          continue;
-        }
-
       if (touchflag == 0x00)
         {
           zero_touch_count++;
           nonready_count = 0;
 
-          if (self->fdt_down_sample_valid)
-            {
-              guint total_drop = 0;
-              guint max_drop = 0;
-
-              if (!zero_base_valid)
-                {
-                  memcpy (zero_base, self->fdt_down_sample, sizeof (zero_base));
-                  zero_base_valid = TRUE;
-                }
-              else
-                {
-                  for (guint i = 0; i < 6; i++)
-                    {
-                      guint drop = zero_base[i] > self->fdt_down_sample[i] ?
-                                   zero_base[i] - self->fdt_down_sample[i] : 0;
-
-                      total_drop += drop;
-                      max_drop = MAX (max_drop, drop);
-                    }
-
-                  fp_dbg ("gdix51c0: zero-touch FDT base delta total=%u max=%u",
-                          total_drop, max_drop);
-
-                  if (max_drop >= GDIX51C0_FDT_HOST_TOUCH_MIN_DROP &&
-                      total_drop >= GDIX51C0_FDT_HOST_TOUCH_TOTAL_DROP)
-                    {
-                      fp_dbg ("gdix51c0: treating zero-touch FDT as finger by base delta");
-                      return TRUE;
-                    }
-                }
-            }
-
-          fp_dbg ("gdix51c0: ignoring zero-touch FDT event %u; backing off",
+          fp_dbg ("gdix51c0: ignoring zero-touch FDT event %u",
                   zero_touch_count);
 
           if (zero_touch_count >= 3)
-            {
-              g_usleep (500000);
-              zero_touch_count = 0;
-            }
-          else
-            {
-              g_usleep (200000);
-            }
+            zero_touch_count = 0;
+
+          if (!gdix51c0_fdt_down_arm (self, error))
+            return FALSE;
 
           continue;
         }
@@ -1069,47 +1185,59 @@ gdix51c0_wait_for_finger (FpiDeviceGdix51c0 *self, GError **error)
       fp_dbg ("gdix51c0: ignoring non-ready FDT touchflag=0x%02x event %u; require clean 0x3f",
               touchflag, nonready_count);
 
-      g_usleep (300000);
+      if (!gdix51c0_fdt_down_arm (self, error))
+        return FALSE;
     }
 }
 
-/* Wait for finger lift with short FDT-down probes.  touchflag returns 0 once
- * the finger is no longer touching.  Used between enroll stages so libfprint's
- * "place finger again" prompt is honoured instead of capturing the same frame
- * back-to-back. */
+/* Wait for finger lift using the official FDT-up mode. */
 static gboolean
-gdix51c0_wait_for_lift (FpiDeviceGdix51c0 *self, GError **error)
+gdix51c0_wait_for_lift (FpiDeviceGdix51c0 *self,
+                        guint              timeout_usec,
+                        GError           **error)
 {
-  fp_dbg ("gdix51c0: waiting for finger lift (short FDT-down probes)...");
   gint64 lift_deadline = g_get_monotonic_time () +
-                          (gint64) GDIX51C0_FINGER_TIMEOUT_USEC;
-  guint retry_count = 0;
+                          (gint64) timeout_usec;
+  guint8 touchflag = 0xff;
+
+  g_usleep (20000);
+  gdix51c0_irq_drain (self->irq_req, self->irq_events);
 
   for (;;)
     {
-      guint8 touchflag = 0xff;
-      gboolean retry = FALSE;
+      gint64 now = g_get_monotonic_time ();
+      guint remaining_usec;
 
-      if (g_get_monotonic_time () >= lift_deadline)
+      if (now >= lift_deadline)
         {
           g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
                                "gdix51c0: finger not lifted within timeout");
           return FALSE;
         }
 
-      if (!gdix51c0_fdt_down_round (self, GDIX51C0_FDT_TIMEOUT_USEC,
-                                    &touchflag, &retry, error))
+      fp_dbg ("gdix51c0: arming FDT-up and waiting for finger lift IRQ...");
+
+      if (!gdix51c0_fdt_up_arm (self, error))
         return FALSE;
 
-      if (retry)
-        {
-          retry_count++;
-          fp_dbg ("gdix51c0: FDT lift retry %u; backing off", retry_count);
-          g_usleep (120000);
-          continue;
-        }
+      g_usleep (20000);
+      gdix51c0_irq_drain (self->irq_req, self->irq_events);
 
-      retry_count = 0;
+      fp_dbg ("gdix51c0: FDT-up armed; waiting for lift response");
+
+      /* The device fires its FDT-up event ~70 ms after arming.  Always give
+       * the read at least that much budget, even past lift_deadline, so we
+       * don't leave a primed event undrained on the SPI bus.  An undrained
+       * event keeps IRQ high and breaks the next FDT-down arm. */
+      now = g_get_monotonic_time ();
+      remaining_usec = (guint) (lift_deadline > now
+                                ? MIN (lift_deadline - now, (gint64) G_MAXUINT)
+                                : 0);
+      if (remaining_usec < GDIX51C0_FDT_UP_DRAIN_USEC)
+        remaining_usec = GDIX51C0_FDT_UP_DRAIN_USEC;
+
+      if (!gdix51c0_fdt_up_read (self, remaining_usec, &touchflag, error))
+        return FALSE;
 
       if (touchflag == 0)
         {
@@ -1117,7 +1245,8 @@ gdix51c0_wait_for_lift (FpiDeviceGdix51c0 *self, GError **error)
           return TRUE;
         }
 
-      g_usleep (100000);
+      fp_dbg ("gdix51c0: FDT-up still sees touchflag=0x%02x; waiting", touchflag);
+      g_usleep (50000);
     }
 }
 
@@ -1183,7 +1312,7 @@ gdix51c0_dump_debug_views (const guint16 *raw)
 }
 
 /* ------------------------------------------------------------------ */
-/* Single image capture (cmd 0x22/0x20 -> ack -> read -> decrypt -> decode). */
+/* Single image capture (cmd 0x22 -> ack -> read -> decrypt -> decode). */
 /* Returns a fresh guint16[GDIX51C0_FRAME_PIXELS] on success.              */
 /* ------------------------------------------------------------------ */
 static guint16 *
@@ -1192,12 +1321,14 @@ gdix51c0_capture_image_raw (FpiDeviceGdix51c0 *self,
                             GError           **error)
 {
   const guint8 img_setmode[] = {
-    retry_image ? GDIX51C0_CMD_IMAGE_T0 : GDIX51C0_CMD_IMAGE_T1,
+    GDIX51C0_CMD_IMAGE_T1,
     0x03, 0x00,
-    retry_image ? 0x00 : 0x01,
+    0x01,
     0x00,
-    retry_image ? 0x87 : 0x84
+    0x84
   };
+
+  (void) retry_image;
 
 #define GDIX51C0_IMAGE_PREFIX_LEN (3 + 5)
 
@@ -1390,6 +1521,51 @@ gdix51c0_capture_image_raw (FpiDeviceGdix51c0 *self,
 }
 
 static gboolean
+gdix51c0_capture_nav_data (FpiDeviceGdix51c0 *self, GError **error)
+{
+  const guint8 nav_data[] = { 0x00, 0x00 };
+  Gdix51c0Bus bus = {
+    .dev = FP_DEVICE (self),
+    .spi_fd = self->spi_fd,
+    .irq_req = self->irq_req,
+    .irq_offset = self->irq_offset,
+    .irq_events = self->irq_events,
+  };
+  gsize nav_pkt_len = 0;
+  gsize nav_len = 0;
+  g_autofree guint8 *nav_packet =
+    gdix51c0_make_payload_packet (GDIX51C0_CMD_NAV_BASE,
+                                  nav_data, sizeof (nav_data),
+                                  &nav_pkt_len);
+  g_autofree guint8 *nav =
+    gdix51c0_cmd_ack_then_resp_read (&bus,
+                                     nav_packet,
+                                     nav_pkt_len,
+                                     GDIX51C0_IMAGE_TIMEOUT_USEC,
+                                     &nav_len,
+                                     "nav-data",
+                                     error);
+
+  if (!nav)
+    return FALSE;
+
+  if (nav_len < 3 || nav[0] != GDIX51C0_CMD_NAV_BASE)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                   "gdix51c0: invalid nav response len=%zu cmd=0x%02x",
+                   nav_len, nav_len > 0 ? nav[0] : 0);
+      return FALSE;
+    }
+
+  fp_dbg ("gdix51c0: nav response len=%zu cmd=0x%02x", nav_len, nav[0]);
+  if (nav_len != GDIX51C0_NAV_RESPONSE_LEN)
+    fp_dbg ("gdix51c0: nav response length was %zu, expected %u",
+            nav_len, GDIX51C0_NAV_RESPONSE_LEN);
+
+  return TRUE;
+}
+
+static gboolean
 gdix51c0_capture_error_needs_session_restart (const GError *error)
 {
   if (!error)
@@ -1538,6 +1714,12 @@ gdix51c0_capture_one_raw8 (FpiDeviceGdix51c0 *self, GError **error)
           return NULL;
         }
 
+      if (!gdix51c0_capture_nav_data (self, &local_error))
+        {
+          g_propagate_error (error, g_steal_pointer (&local_error));
+          return NULL;
+        }
+
       return gdix51c0_normalize_raw8 (raw);
     }
 
@@ -1548,59 +1730,35 @@ gdix51c0_capture_one_raw8 (FpiDeviceGdix51c0 *self, GError **error)
   return NULL;
 }
 
-static guint8 *
-gdix51c0_recapture_one_raw8 (FpiDeviceGdix51c0 *self,
-                             gboolean          *finger_still_down,
-                             GError           **error)
-{
-  guint8 touchflag = 0;
-  g_autoptr(GError) local_error = NULL;
-  g_autofree guint16 *raw = NULL;
-
-  *finger_still_down = FALSE;
-
-  if (!gdix51c0_fdt_manual_round (self, &touchflag, &local_error))
-    {
-      fp_dbg ("gdix51c0: retry FDT manual failed: %s",
-              local_error ? local_error->message : "?");
-      return NULL;
-    }
-
-  fp_dbg ("gdix51c0: retry FDT manual touchflag=0x%02x", touchflag);
-
-  if (touchflag == 0 || touchflag == GDIX51C0_TOUCH_IGNORE)
-    return NULL;
-
-  *finger_still_down = TRUE;
-  raw = gdix51c0_capture_image_raw (self, TRUE, &local_error);
-  if (!raw)
-    {
-      if (gdix51c0_capture_error_needs_session_restart (local_error))
-        {
-          g_propagate_error (error, g_steal_pointer (&local_error));
-          return NULL;
-        }
-
-      fp_dbg ("gdix51c0: retry image capture failed: %s",
-              local_error ? local_error->message : "?");
-      return NULL;
-    }
-
-  return gdix51c0_normalize_raw8 (raw);
-}
-
-static void
-gdix51c0_wait_for_lift_report (FpiDeviceGdix51c0 *self)
+static gboolean
+gdix51c0_wait_for_lift_report (FpiDeviceGdix51c0 *self,
+                               guint              timeout_usec,
+                               gboolean           allow_fdt_down_gap)
 {
   GError *lift_err = NULL;
 
-  if (!gdix51c0_wait_for_lift (self, &lift_err))
+  if (!gdix51c0_wait_for_lift (self, timeout_usec, &lift_err))
     {
+      if (allow_fdt_down_gap &&
+          g_error_matches (lift_err, G_IO_ERROR, G_IO_ERROR_TIMED_OUT))
+        {
+          fp_dbg ("gdix51c0: FDT-up did not observe lift; requiring FDT-down zero-touch gap");
+          self->require_lift_gap = TRUE;
+          g_clear_error (&lift_err);
+          fpi_device_report_finger_status (FP_DEVICE (self), FP_FINGER_STATUS_NONE);
+          return TRUE;
+        }
+
       fp_warn ("gdix51c0: lift wait failed (%s), reporting off anyway",
                lift_err ? lift_err->message : "?");
       g_clear_error (&lift_err);
+      fpi_device_report_finger_status (FP_DEVICE (self), FP_FINGER_STATUS_NONE);
+      return FALSE;
     }
+
+  self->require_lift_gap = FALSE;
   fpi_device_report_finger_status (FP_DEVICE (self), FP_FINGER_STATUS_NONE);
+  return TRUE;
 }
 
 static gint
@@ -1745,7 +1903,16 @@ gdix51c0_enroll (FpDevice *dev)
       fpi_device_enroll_progress (dev, stage + 1, NULL, NULL);
 
       if (stage + 1 < GDIX51C0_ENROLL_SAMPLES)
-        gdix51c0_wait_for_lift_report (self);
+        {
+          if (!gdix51c0_wait_for_lift_report (self,
+                                              GDIX51C0_ENROLL_LIFT_TIMEOUT_USEC,
+                                              TRUE))
+            {
+              g_set_error_literal (&error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
+                                   "gdix51c0: finger was not lifted between enrollment stages");
+              goto out;
+            }
+        }
     }
 
   fpi_device_get_enroll_data (dev, &print);
@@ -1800,7 +1967,6 @@ gdix51c0_verify_or_identify (FpDevice *dev)
 
   for (guint attempt = 1; attempt <= GDIX51C0_VERIFY_CAPTURE_ATTEMPTS; attempt++)
     {
-      gboolean finger_still_down = TRUE;
       gint probe_kp;
 
       if (probe_info)
@@ -1811,17 +1977,26 @@ gdix51c0_verify_or_identify (FpDevice *dev)
 
       g_clear_pointer (&image, g_free);
 
-      if (attempt == 1)
-        image = gdix51c0_capture_one_raw8 (self, &error);
-      else
-        image = gdix51c0_recapture_one_raw8 (self, &finger_still_down, &error);
+      if (attempt > 1)
+        {
+          fp_dbg ("gdix51c0: verify retry %u, waiting for finger lift...", attempt);
+          if (!gdix51c0_wait_for_lift_report (self,
+                                              GDIX51C0_FINGER_TIMEOUT_USEC,
+                                              FALSE))
+            {
+              g_set_error_literal (&error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
+                                   "gdix51c0: finger was not lifted before verify retry");
+              goto out;
+            }
+          fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED);
+        }
+
+      image = gdix51c0_capture_one_raw8 (self, &error);
 
       if (!image)
         {
           if (error)
             goto out;
-          if (!finger_still_down)
-            fp_dbg ("gdix51c0: stopping verify retry because finger is no longer down");
           break;
         }
 
@@ -1939,7 +2114,14 @@ out:
   if (probe_info)
     sigfm_free_info (probe_info);
   if (saw_finger)
-    gdix51c0_wait_for_lift_report (self);
+    {
+      if (self->session_desynced)
+        fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NONE);
+      else
+        gdix51c0_wait_for_lift_report (self,
+                                       GDIX51C0_LIFT_CLEANUP_TIMEOUT_USEC,
+                                       FALSE);
+    }
   gdix51c0_session_deactivate (self);
 
   if (action == FPI_DEVICE_ACTION_VERIFY)

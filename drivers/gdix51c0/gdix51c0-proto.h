@@ -119,7 +119,15 @@ gboolean gdix51c0_cmd_ack_resp (Gdix51c0Bus *bus, const guint8 *payload, gsize l
  * reset_sensor (cmd 0xa2).
  */
 gboolean gdix51c0_cmd_ack_then_resp (Gdix51c0Bus *bus, const guint8 *payload, gsize len,
-                                  const char *label, GError **error);
+                                   const char *label, GError **error);
+
+guint8 *gdix51c0_cmd_ack_then_resp_read (Gdix51c0Bus *bus,
+                                         const guint8 *payload,
+                                         gsize len,
+                                         guint timeout_usec,
+                                         gsize *out_len,
+                                         const char *label,
+                                         GError **error);
 
 /*
  * write payload, wait IRQ rise, read ack, wait IRQ fall.  Returns the

@@ -573,9 +573,65 @@ gdix51c0_cmd_ack_then_resp (Gdix51c0Bus *bus,
     return FALSE;
 
   return gdix51c0_irq_wait_edge_strict (bus->irq_req, bus->irq_events, FALSE,
-                                        bus->irq_offset,
-                                        GDIX51C0_CMD_TIMEOUT_USEC,
-                                        label, error);
+                                         bus->irq_offset,
+                                         GDIX51C0_CMD_TIMEOUT_USEC,
+                                         label, error);
+}
+
+guint8 *
+gdix51c0_cmd_ack_then_resp_read (Gdix51c0Bus *bus,
+                                 const guint8 *payload,
+                                 gsize len,
+                                 guint timeout_usec,
+                                 gsize *out_len,
+                                 const char *label,
+                                 GError **error)
+{
+  fp_dbg ("gdix51c0: %s (ack then resp read, %zu B)", label, len);
+
+  g_usleep (20000);
+  gdix51c0_irq_drain (bus->irq_req, bus->irq_events);
+
+  if (!gdix51c0_spi_write (bus->dev, bus->spi_fd,
+                           GDIX51C0_PKT_WRITE, payload, len, error))
+    return NULL;
+
+  if (!gdix51c0_irq_wait_edge_strict (bus->irq_req, bus->irq_events, TRUE,
+                                      bus->irq_offset,
+                                      timeout_usec,
+                                      label, error))
+    return NULL;
+
+  if (!gdix51c0_read_and_drop (bus, label, error))
+    return NULL;
+
+  if (!gdix51c0_irq_wait_edge_strict (bus->irq_req, bus->irq_events, FALSE,
+                                      bus->irq_offset,
+                                      timeout_usec,
+                                      label, error))
+    return NULL;
+
+  if (!gdix51c0_irq_wait_edge_strict (bus->irq_req, bus->irq_events, TRUE,
+                                      bus->irq_offset,
+                                      timeout_usec,
+                                      label, error))
+    return NULL;
+
+  guint8 *buf = gdix51c0_spi_read (bus->dev, bus->spi_fd, out_len, error);
+  if (!buf)
+    return NULL;
+
+  if (!gdix51c0_irq_wait_edge_strict (bus->irq_req, bus->irq_events, FALSE,
+                                      bus->irq_offset,
+                                      timeout_usec,
+                                      label, error))
+    {
+      g_free (buf);
+      return NULL;
+    }
+
+  fp_dbg ("gdix51c0: %s response read %zu B", label, out_len ? *out_len : 0);
+  return buf;
 }
 
 guint8 *
@@ -757,8 +813,8 @@ gdix51c0_irq_wait_edge_strict (struct gpiod_line_request *irq_req,
           if (!ev)
             continue;
 
-          if (gpiod_edge_event_get_event_type (ev) != want)
-            continue;
+          if (gpiod_edge_event_get_event_type (ev) == want)
+            return TRUE;
 
           enum gpiod_line_value value =
             gpiod_line_request_get_value (irq_req, irq_offset);
