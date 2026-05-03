@@ -711,48 +711,28 @@ gdix51c0_cmd_ack_optional_resp (Gdix51c0Bus *bus,
   if (!gdix51c0_read_and_drop (bus, label, error))
     return FALSE;
 
+  /*
+   * These init commands report ACK and their small status/version packet in
+   * the same IRQ-high window. If we wait for falling edge before reading the
+   * optional packet, the MCU can hold IRQ high for about two seconds.
+   */
+  {
+    g_autoptr(GError) local_error = NULL;
+
+    if (!gdix51c0_read_and_drop (bus, label, &local_error))
+      fp_dbg ("gdix51c0: %s optional response read failed: %s",
+              label,
+              local_error ? local_error->message : "?");
+  }
+
   if (!gdix51c0_irq_wait (bus->irq_req,
                           bus->irq_events,
                           FALSE,
                           bus->irq_offset,
-                          GDIX51C0_CMD_TIMEOUT_USEC,
+                          optional_timeout_usec,
                           label,
-                          error))
-    return FALSE;
-
-  /*
-   * Some init commands sometimes produce a second 6-byte status/ACK-like
-   * packet, and sometimes do not. Do not fail if it is absent.
-   */
-  if (gpiod_line_request_wait_edge_events (bus->irq_req,
-                                           optional_timeout_usec * 1000) > 0)
-    {
-      if (!gdix51c0_irq_wait (bus->irq_req,
-                              bus->irq_events,
-                              TRUE,
-                              bus->irq_offset,
-                              optional_timeout_usec,
-                              label,
-                              NULL))
-        return TRUE;
-
-      g_autoptr(GError) local_error = NULL;
-      if (!gdix51c0_read_and_drop (bus, label, &local_error))
-        {
-          fp_dbg ("gdix51c0: %s optional response read failed: %s",
-                   label,
-                   local_error ? local_error->message : "?");
-          return TRUE;
-        }
-
-      gdix51c0_irq_wait (bus->irq_req,
-                         bus->irq_events,
-                         FALSE,
-                         bus->irq_offset,
-                         optional_timeout_usec,
-                         label,
-                         NULL);
-    }
+                          NULL))
+    fp_dbg ("gdix51c0: %s IRQ did not fall after optional response window", label);
 
   return TRUE;
 }

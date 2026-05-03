@@ -48,6 +48,8 @@ struct _FpiDeviceGdix51c0
 
   gboolean                   skip_next_identify;
   gboolean                   session_desynced;
+  GMainContext              *action_context;
+  GCancellable              *action_cancellable;
 
   guint8                     fdt_down_regs[12];
   guint16                    fdt_down_sample[6];
@@ -58,7 +60,7 @@ struct _FpiDeviceGdix51c0
 G_DEFINE_TYPE (FpiDeviceGdix51c0, fpi_device_gdix51c0, FP_TYPE_DEVICE);
 
 #define GDIX51C0_TOUCH_IGNORE 0xff
-#define GDIX51C0_VERIFY_CAPTURE_ATTEMPTS 3
+#define GDIX51C0_VERIFY_CAPTURE_ATTEMPTS 1
 #define GDIX51C0_FDT_UP_THRESHOLD_OFFSET 29
 /* Minimum time to wait for an armed FDT-up event to fire so we can drain it.
  * The device typically fires ~70 ms after arming; if we abandon the read
@@ -67,7 +69,24 @@ G_DEFINE_TYPE (FpiDeviceGdix51c0, fpi_device_gdix51c0, FP_TYPE_DEVICE);
 #define GDIX51C0_FDT_UP_DRAIN_USEC      (300 * 1000)
 #define GDIX51C0_ENROLL_LIFT_TIMEOUT_USEC (2 * 1000 * 1000)
 #define GDIX51C0_LIFT_CLEANUP_TIMEOUT_USEC (5 * 1000 * 1000)
+#define GDIX51C0_CANCEL_POLL_USEC       (500 * 1000)
 #define GDIX51C0_NAV_RESPONSE_LEN 2413
+
+typedef enum {
+  GDIX51C0_ACTION_ENROLL,
+  GDIX51C0_ACTION_VERIFY,
+  GDIX51C0_ACTION_IDENTIFY,
+} Gdix51c0ActionKind;
+
+typedef struct {
+  FpDevice            *dev;
+  Gdix51c0ActionKind   kind;
+  GMainContext        *context;
+  GCancellable        *cancellable;
+  FpPrint             *enroll_print;
+  FpPrint             *verify_print;
+  GPtrArray           *identify_gallery;
+} Gdix51c0ActionThread;
 
 static const guint8 gdix51c0_default_fdt_down_regs[12] = {
   0x80, 0xad, 0x80, 0xbb, 0x80, 0xa2,
@@ -85,6 +104,23 @@ gdix51c0_env_int (const char *name, int fallback)
   if (!s || !*s)
     return fallback;
   return (int) g_ascii_strtoll (s, NULL, 0);
+}
+
+static guint
+gdix51c0_fdt_touch_count (guint8 touchflag)
+{
+  guint count = 0;
+
+  for (guint8 zones = touchflag & 0x3f; zones; zones >>= 1)
+    count += zones & 1;
+
+  return count;
+}
+
+static gboolean
+gdix51c0_fdt_touch_is_finger (guint8 touchflag)
+{
+  return gdix51c0_fdt_touch_count (touchflag) >= 5;
 }
 
 /* libgpiod v2: chip → line settings → line config → request.  For the
@@ -523,24 +559,9 @@ gdix51c0_load_psk (guint8 out[32], GError **err)
 static void gdix51c0_session_deactivate (FpiDeviceGdix51c0 *self);
 
 static gboolean
-gdix51c0_session_activate_once (FpiDeviceGdix51c0 *self, GError **error)
+gdix51c0_session_tls_start (FpiDeviceGdix51c0 *self, GError **error)
 {
   guint8 psk[32];
-
-  G_DEBUG_HERE ();
-
-  self->session_desynced = FALSE;
-  self->fdt_down_sample_valid = FALSE;
-  self->require_lift_gap = FALSE;
-  memcpy (self->fdt_down_regs,
-          gdix51c0_default_fdt_down_regs,
-          sizeof (self->fdt_down_regs));
-
-  if (!gdix51c0_boot_probe (self, error))
-    return FALSE;
-
-  if (!gdix51c0_init_sequence (self, error))
-    return FALSE;
 
   if (!gdix51c0_load_psk (psk, error))
     return FALSE;
@@ -584,6 +605,8 @@ gdix51c0_session_activate_once (FpiDeviceGdix51c0 *self, GError **error)
                    G_IO_ERROR_CONNECTION_CLOSED,
                    "gdix51c0: post-tls-d4 failed after TLS: %s",
                    d4_error ? d4_error->message : "?");
+        gdix51c0_tls_free (&self->tls);
+        self->tls_ready = FALSE;
         return FALSE;
       }
   }
@@ -592,9 +615,43 @@ gdix51c0_session_activate_once (FpiDeviceGdix51c0 *self, GError **error)
   return TRUE;
 }
 
+static void
+gdix51c0_session_reset_capture_state (FpiDeviceGdix51c0 *self)
+{
+  self->session_desynced = FALSE;
+  self->fdt_down_sample_valid = FALSE;
+  self->require_lift_gap = FALSE;
+  memcpy (self->fdt_down_regs,
+          gdix51c0_default_fdt_down_regs,
+          sizeof (self->fdt_down_regs));
+}
+
+static gboolean
+gdix51c0_session_activate_once (FpiDeviceGdix51c0 *self, GError **error)
+{
+  G_DEBUG_HERE ();
+
+  gdix51c0_session_reset_capture_state (self);
+
+  if (!gdix51c0_boot_probe (self, error))
+    return FALSE;
+
+  if (!gdix51c0_init_sequence (self, error))
+    return FALSE;
+
+  return gdix51c0_session_tls_start (self, error);
+}
+
 static gboolean
 gdix51c0_session_activate (FpiDeviceGdix51c0 *self, GError **error)
 {
+  if (self->tls_ready)
+    {
+      gdix51c0_session_reset_capture_state (self);
+      fp_dbg ("gdix51c0: reusing active TLS session");
+      return TRUE;
+    }
+
   for (guint attempt = 0; attempt < 4; attempt++)
     {
       g_autoptr(GError) local_error = NULL;
@@ -1068,6 +1125,236 @@ gdix51c0_fdt_up_read (FpiDeviceGdix51c0 *self,
   return TRUE;
 }
 
+typedef struct {
+  FpDevice           *dev;
+  FpFingerStatusFlags status;
+} Gdix51c0FingerStatusEvent;
+
+typedef struct {
+  FpDevice *dev;
+  gint      completed_stages;
+} Gdix51c0EnrollProgressEvent;
+
+typedef struct {
+  FpDevice *dev;
+  FpPrint  *print;
+  GVariant *data;
+  GError   *error;
+} Gdix51c0EnrollCompleteEvent;
+
+typedef struct {
+  FpDevice            *dev;
+  Gdix51c0ActionKind   kind;
+  gboolean             report_result;
+  FpiMatchResult       verify_result;
+  FpPrint             *identify_match;
+  GError              *error;
+} Gdix51c0MatchCompleteEvent;
+
+static GMainContext *
+gdix51c0_action_context_ref (FpiDeviceGdix51c0 *self)
+{
+  if (self->action_context)
+    return g_main_context_ref (self->action_context);
+
+  return g_main_context_ref (g_main_context_default ());
+}
+
+static void
+gdix51c0_finger_status_event_free (Gdix51c0FingerStatusEvent *event)
+{
+  g_object_unref (event->dev);
+  g_free (event);
+}
+
+static gboolean
+gdix51c0_report_finger_status_main (gpointer user_data)
+{
+  Gdix51c0FingerStatusEvent *event = user_data;
+
+  fpi_device_report_finger_status (event->dev, event->status);
+  return G_SOURCE_REMOVE;
+}
+
+static void
+gdix51c0_report_finger_status_on_main (FpiDeviceGdix51c0   *self,
+                                       FpFingerStatusFlags  status)
+{
+  Gdix51c0FingerStatusEvent *event = g_new0 (Gdix51c0FingerStatusEvent, 1);
+  GMainContext *context = gdix51c0_action_context_ref (self);
+
+  event->dev = g_object_ref (FP_DEVICE (self));
+  event->status = status;
+  g_main_context_invoke_full (context,
+                              G_PRIORITY_DEFAULT,
+                              gdix51c0_report_finger_status_main,
+                              event,
+                              (GDestroyNotify) gdix51c0_finger_status_event_free);
+  g_main_context_unref (context);
+}
+
+static void
+gdix51c0_enroll_progress_event_free (Gdix51c0EnrollProgressEvent *event)
+{
+  g_object_unref (event->dev);
+  g_free (event);
+}
+
+static gboolean
+gdix51c0_enroll_progress_main (gpointer user_data)
+{
+  Gdix51c0EnrollProgressEvent *event = user_data;
+
+  fpi_device_enroll_progress (event->dev, event->completed_stages, NULL, NULL);
+  return G_SOURCE_REMOVE;
+}
+
+static void
+gdix51c0_enroll_progress_on_main (FpiDeviceGdix51c0 *self,
+                                  gint               completed_stages)
+{
+  Gdix51c0EnrollProgressEvent *event = g_new0 (Gdix51c0EnrollProgressEvent, 1);
+  GMainContext *context = gdix51c0_action_context_ref (self);
+
+  event->dev = g_object_ref (FP_DEVICE (self));
+  event->completed_stages = completed_stages;
+  g_main_context_invoke_full (context,
+                              G_PRIORITY_DEFAULT,
+                              gdix51c0_enroll_progress_main,
+                              event,
+                              (GDestroyNotify) gdix51c0_enroll_progress_event_free);
+  g_main_context_unref (context);
+}
+
+static void
+gdix51c0_enroll_complete_event_free (Gdix51c0EnrollCompleteEvent *event)
+{
+  g_object_unref (event->dev);
+  g_clear_object (&event->print);
+  g_clear_pointer (&event->data, g_variant_unref);
+  g_clear_error (&event->error);
+  g_free (event);
+}
+
+static gboolean
+gdix51c0_enroll_complete_main (gpointer user_data)
+{
+  Gdix51c0EnrollCompleteEvent *event = user_data;
+
+  if (event->error)
+    {
+      fpi_device_enroll_complete (event->dev, NULL, g_steal_pointer (&event->error));
+      return G_SOURCE_REMOVE;
+    }
+
+  if (!event->print || !event->data)
+    {
+      fpi_device_enroll_complete (event->dev, NULL,
+                                  fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                                                            "gdix51c0: missing enrollment result"));
+      return G_SOURCE_REMOVE;
+    }
+
+  fpi_print_set_type (event->print, FPI_PRINT_RAW);
+  g_object_set (G_OBJECT (event->print), "fpi-data", event->data, NULL);
+  fpi_device_enroll_complete (event->dev, g_object_ref (event->print), NULL);
+  return G_SOURCE_REMOVE;
+}
+
+static void
+gdix51c0_enroll_complete_on_main (FpiDeviceGdix51c0 *self,
+                                  FpPrint           *print,
+                                  GVariant          *data,
+                                  GError            *error)
+{
+  Gdix51c0EnrollCompleteEvent *event = g_new0 (Gdix51c0EnrollCompleteEvent, 1);
+  GMainContext *context = gdix51c0_action_context_ref (self);
+
+  event->dev = g_object_ref (FP_DEVICE (self));
+  event->print = print ? g_object_ref (print) : NULL;
+  event->data = data;
+  event->error = error;
+  g_main_context_invoke_full (context,
+                              G_PRIORITY_DEFAULT,
+                              gdix51c0_enroll_complete_main,
+                              event,
+                              (GDestroyNotify) gdix51c0_enroll_complete_event_free);
+  g_main_context_unref (context);
+}
+
+static void
+gdix51c0_match_complete_event_free (Gdix51c0MatchCompleteEvent *event)
+{
+  g_object_unref (event->dev);
+  g_clear_object (&event->identify_match);
+  g_clear_error (&event->error);
+  g_free (event);
+}
+
+static gboolean
+gdix51c0_match_complete_main (gpointer user_data)
+{
+  Gdix51c0MatchCompleteEvent *event = user_data;
+
+  if (event->kind == GDIX51C0_ACTION_VERIFY)
+    {
+      if (!event->error && event->report_result)
+        fpi_device_verify_report (event->dev, event->verify_result, NULL, NULL);
+
+      fpi_device_verify_complete (event->dev, g_steal_pointer (&event->error));
+    }
+  else
+    {
+      if (!event->error && event->report_result)
+        fpi_device_identify_report (event->dev, event->identify_match, NULL, NULL);
+
+      fpi_device_identify_complete (event->dev, g_steal_pointer (&event->error));
+    }
+
+  return G_SOURCE_REMOVE;
+}
+
+static void
+gdix51c0_match_complete_on_main (FpiDeviceGdix51c0 *self,
+                                 Gdix51c0ActionKind kind,
+                                 gboolean           report_result,
+                                 FpiMatchResult     verify_result,
+                                 FpPrint           *identify_match,
+                                 GError            *error)
+{
+  Gdix51c0MatchCompleteEvent *event = g_new0 (Gdix51c0MatchCompleteEvent, 1);
+  GMainContext *context = gdix51c0_action_context_ref (self);
+
+  event->dev = g_object_ref (FP_DEVICE (self));
+  event->kind = kind;
+  event->report_result = report_result;
+  event->verify_result = verify_result;
+  event->identify_match = identify_match ? g_object_ref (identify_match) : NULL;
+  event->error = error;
+  g_main_context_invoke_full (context,
+                              G_PRIORITY_DEFAULT,
+                              gdix51c0_match_complete_main,
+                              event,
+                              (GDestroyNotify) gdix51c0_match_complete_event_free);
+  g_main_context_unref (context);
+}
+
+static gboolean
+gdix51c0_action_check_cancelled (FpiDeviceGdix51c0 *self,
+                                 GError           **error)
+{
+  GCancellable *cancellable = self->action_cancellable;
+
+  if (cancellable && g_cancellable_set_error_if_cancelled (cancellable, error))
+    {
+      fp_dbg ("gdix51c0: current action was cancelled");
+      self->session_desynced = TRUE;
+      return TRUE;
+    }
+
+  return FALSE;
+}
+
 static gboolean
 gdix51c0_wait_for_finger (FpiDeviceGdix51c0 *self, GError **error)
 {
@@ -1088,6 +1375,10 @@ gdix51c0_wait_for_finger (FpiDeviceGdix51c0 *self, GError **error)
       guint8 touchflag = 0;
       gint64 now = g_get_monotonic_time ();
       guint remaining_usec;
+      guint wait_usec;
+
+      if (gdix51c0_action_check_cancelled (self, error))
+        return FALSE;
 
       if (now >= finger_deadline)
         {
@@ -1098,8 +1389,9 @@ gdix51c0_wait_for_finger (FpiDeviceGdix51c0 *self, GError **error)
 
       remaining_usec = (guint) MIN (finger_deadline - now,
                                     (gint64) G_MAXUINT);
+      wait_usec = MIN (remaining_usec, (guint) GDIX51C0_CANCEL_POLL_USEC);
 
-      if (!gdix51c0_fdt_down_read (self, remaining_usec,
+      if (!gdix51c0_fdt_down_read (self, wait_usec,
                                    &touchflag, &local_error))
         {
           retry_count++;
@@ -1149,9 +1441,10 @@ gdix51c0_wait_for_finger (FpiDeviceGdix51c0 *self, GError **error)
             }
         }
 
-      if (touchflag == 0x3f)
+      if (gdix51c0_fdt_touch_is_finger (touchflag))
         {
-          fp_dbg ("gdix51c0: finger detected, touchflag=0x%02x", touchflag);
+          fp_dbg ("gdix51c0: finger detected, touchflag=0x%02x zones=%u",
+                  touchflag, gdix51c0_fdt_touch_count (touchflag));
           return TRUE;
         }
 
@@ -1177,13 +1470,14 @@ gdix51c0_wait_for_finger (FpiDeviceGdix51c0 *self, GError **error)
        * capture. Do not start cmd 0x22 from this state.
        *
        * The UI may feel like it wants to keep scanning after no-match, but
-       * for security we require a clean 0x3f placement.
+       * Windows accepts five or six active FDT zones; fewer zones are usually
+       * edge contact and produce weak frames.
        */
       nonready_count++;
       zero_touch_count = 0;
 
-      fp_dbg ("gdix51c0: ignoring non-ready FDT touchflag=0x%02x event %u; require clean 0x3f",
-              touchflag, nonready_count);
+      fp_dbg ("gdix51c0: ignoring non-ready FDT touchflag=0x%02x zones=%u event %u; require 5/6 zones",
+              touchflag, gdix51c0_fdt_touch_count (touchflag), nonready_count);
 
       if (!gdix51c0_fdt_down_arm (self, error))
         return FALSE;
@@ -1207,6 +1501,9 @@ gdix51c0_wait_for_lift (FpiDeviceGdix51c0 *self,
     {
       gint64 now = g_get_monotonic_time ();
       guint remaining_usec;
+
+      if (gdix51c0_action_check_cancelled (self, error))
+        return FALSE;
 
       if (now >= lift_deadline)
         {
@@ -1235,6 +1532,7 @@ gdix51c0_wait_for_lift (FpiDeviceGdix51c0 *self,
                                 : 0);
       if (remaining_usec < GDIX51C0_FDT_UP_DRAIN_USEC)
         remaining_usec = GDIX51C0_FDT_UP_DRAIN_USEC;
+      remaining_usec = MIN (remaining_usec, (guint) GDIX51C0_CANCEL_POLL_USEC);
 
       if (!gdix51c0_fdt_up_read (self, remaining_usec, &touchflag, error))
         return FALSE;
@@ -1676,8 +1974,7 @@ gdix51c0_capture_one_raw8 (FpiDeviceGdix51c0 *self, GError **error)
                   return NULL;
                 }
 
-              fpi_device_report_finger_status (FP_DEVICE (self),
-                                               FP_FINGER_STATUS_NEEDED);
+              gdix51c0_report_finger_status_on_main (self, FP_FINGER_STATUS_NEEDED);
               continue;
             }
 
@@ -1685,8 +1982,7 @@ gdix51c0_capture_one_raw8 (FpiDeviceGdix51c0 *self, GError **error)
           return NULL;
         }
 
-      fpi_device_report_finger_status (FP_DEVICE (self),
-                                       FP_FINGER_STATUS_PRESENT);
+      gdix51c0_report_finger_status_on_main (self, FP_FINGER_STATUS_PRESENT);
 
       raw = gdix51c0_capture_image_raw (self, FALSE, &local_error);
       if (!raw)
@@ -1705,8 +2001,7 @@ gdix51c0_capture_one_raw8 (FpiDeviceGdix51c0 *self, GError **error)
                   return NULL;
                 }
 
-              fpi_device_report_finger_status (FP_DEVICE (self),
-                                               FP_FINGER_STATUS_NEEDED);
+              gdix51c0_report_finger_status_on_main (self, FP_FINGER_STATUS_NEEDED);
               continue;
             }
 
@@ -1745,19 +2040,19 @@ gdix51c0_wait_for_lift_report (FpiDeviceGdix51c0 *self,
           fp_dbg ("gdix51c0: FDT-up did not observe lift; requiring FDT-down zero-touch gap");
           self->require_lift_gap = TRUE;
           g_clear_error (&lift_err);
-          fpi_device_report_finger_status (FP_DEVICE (self), FP_FINGER_STATUS_NONE);
+          gdix51c0_report_finger_status_on_main (self, FP_FINGER_STATUS_NONE);
           return TRUE;
         }
 
       fp_warn ("gdix51c0: lift wait failed (%s), reporting off anyway",
                lift_err ? lift_err->message : "?");
       g_clear_error (&lift_err);
-      fpi_device_report_finger_status (FP_DEVICE (self), FP_FINGER_STATUS_NONE);
+      gdix51c0_report_finger_status_on_main (self, FP_FINGER_STATUS_NONE);
       return FALSE;
     }
 
   self->require_lift_gap = FALSE;
-  fpi_device_report_finger_status (FP_DEVICE (self), FP_FINGER_STATUS_NONE);
+  gdix51c0_report_finger_status_on_main (self, FP_FINGER_STATUS_NONE);
   return TRUE;
 }
 
@@ -1865,26 +2160,31 @@ gdix51c0_sigfm_is_match (gint best_score,
   if (probe_kp < GDIX51C0_SIGFM_PROBE_KP_MIN)
     return FALSE;
 
-  if (best_score >= GDIX51C0_SIGFM_SCORE_STRONG &&
-      medium_samples >= 1 &&
-      weak_samples >= 2)
+  /* A genuine same-finger probe should hit several enrolled samples with a
+   * high inlier count, not score one outlier and a few coincidental mid
+   * scores.  Require at least two strong samples plus medium/weak support. */
+  if (strong_samples >= 2 &&
+      medium_samples >= 3 &&
+      weak_samples >= 4)
     return TRUE;
 
-  if (best_score >= GDIX51C0_SIGFM_SCORE_MEDIUM &&
-      medium_samples >= 1 &&
-      weak_samples >= 2)
+  if (best_score >= GDIX51C0_SIGFM_SCORE_STRONG &&
+      strong_samples >= 1 &&
+      medium_samples >= 3 &&
+      weak_samples >= 5)
     return TRUE;
 
   return FALSE;
 }
 
 static void
-gdix51c0_enroll (FpDevice *dev)
+gdix51c0_enroll_sync (FpDevice *dev,
+                      FpPrint  *print)
 {
   FpiDeviceGdix51c0 *self = FPI_DEVICE_GDIX51C0 (dev);
   g_autoptr(GPtrArray) images = NULL;
+  g_autoptr(GVariant) data = NULL;
   GError *error = NULL;
-  FpPrint *print = NULL;
 
   if (!gdix51c0_session_activate (self, &error))
     goto out;
@@ -1894,13 +2194,13 @@ gdix51c0_enroll (FpDevice *dev)
     {
       guint8 *image;
 
-      fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED);
+      gdix51c0_report_finger_status_on_main (self, FP_FINGER_STATUS_NEEDED);
       image = gdix51c0_capture_one_raw8 (self, &error);
       if (!image)
         goto out;
 
       g_ptr_array_add (images, image);
-      fpi_device_enroll_progress (dev, stage + 1, NULL, NULL);
+      gdix51c0_enroll_progress_on_main (self, stage + 1);
 
       if (stage + 1 < GDIX51C0_ENROLL_SAMPLES)
         {
@@ -1915,12 +2215,8 @@ gdix51c0_enroll (FpDevice *dev)
         }
     }
 
-  fpi_device_get_enroll_data (dev, &print);
-  fpi_print_set_type (print, FPI_PRINT_RAW);
-
   {
     GVariantBuilder builder;
-    g_autoptr(GVariant) data = NULL;
 
     g_variant_builder_init (&builder, G_VARIANT_TYPE ("aay"));
     for (guint i = 0; i < images->len; i++)
@@ -1934,7 +2230,6 @@ gdix51c0_enroll (FpDevice *dev)
       }
 
     data = g_variant_ref_sink (g_variant_builder_end (&builder));
-    g_object_set (G_OBJECT (print), "fpi-data", data, NULL);
   }
 
   self->skip_next_identify = TRUE;
@@ -1943,27 +2238,29 @@ gdix51c0_enroll (FpDevice *dev)
 
 out:
   gdix51c0_session_deactivate (self);
-  if (error)
-    fpi_device_enroll_complete (dev, NULL, error);
-  else
-    fpi_device_enroll_complete (dev, g_object_ref (print), NULL);
+  gdix51c0_enroll_complete_on_main (self, print, g_steal_pointer (&data), error);
 }
 
 static void
-gdix51c0_verify_or_identify (FpDevice *dev)
+gdix51c0_verify_or_identify (FpDevice            *dev,
+                             Gdix51c0ActionKind   kind,
+                             FpPrint             *verify_template,
+                             GPtrArray           *identify_gallery)
 {
   FpiDeviceGdix51c0 *self = FPI_DEVICE_GDIX51C0 (dev);
-  FpiDeviceAction action = fpi_device_get_current_action (dev);
   g_autofree guint8 *image = NULL;
   SigfmImgInfo *probe_info = NULL;
   GError *error = NULL;
   gboolean saw_finger = FALSE;
   gboolean reported = FALSE;
+  gboolean reported_match = FALSE;
+  FpiMatchResult final_verify_result = FPI_MATCH_FAIL;
+  FpPrint *final_identify_match = NULL;
 
   if (!gdix51c0_session_activate (self, &error))
     goto out;
 
-  fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED);
+  gdix51c0_report_finger_status_on_main (self, FP_FINGER_STATUS_NEEDED);
 
   for (guint attempt = 1; attempt <= GDIX51C0_VERIFY_CAPTURE_ATTEMPTS; attempt++)
     {
@@ -1988,7 +2285,7 @@ gdix51c0_verify_or_identify (FpDevice *dev)
                                    "gdix51c0: finger was not lifted before verify retry");
               goto out;
             }
-          fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED);
+          gdix51c0_report_finger_status_on_main (self, FP_FINGER_STATUS_NEEDED);
         }
 
       image = gdix51c0_capture_one_raw8 (self, &error);
@@ -2018,23 +2315,21 @@ gdix51c0_verify_or_identify (FpDevice *dev)
           break;
         }
 
-      if (action == FPI_DEVICE_ACTION_VERIFY)
+      if (kind == GDIX51C0_ACTION_VERIFY)
         {
-          FpPrint *template = NULL;
           gint best_score = 0;
           gint weak_samples = 0;
           gint medium_samples = 0;
           gint strong_samples = 0;
           FpiMatchResult result;
 
-          fpi_device_get_verify_data (dev, &template);
-          best_score = gdix51c0_match_print (probe_info, template,
+          best_score = gdix51c0_match_print (probe_info, verify_template,
                                              &weak_samples, &medium_samples, &strong_samples, &error);
           if (error)
             goto out;
 
           result = gdix51c0_sigfm_is_match (best_score, weak_samples, medium_samples, strong_samples, probe_kp) ?
-                  FPI_MATCH_SUCCESS : FPI_MATCH_FAIL;
+                   FPI_MATCH_SUCCESS : FPI_MATCH_FAIL;
 
           fp_dbg ("gdix51c0: verify decision attempt=%u best=%d weak_samples=%d medium_samples=%d strong_samples=%d result=%s",
                   attempt,
@@ -2046,8 +2341,9 @@ gdix51c0_verify_or_identify (FpDevice *dev)
 
           if (result == FPI_MATCH_SUCCESS || attempt == GDIX51C0_VERIFY_CAPTURE_ATTEMPTS)
             {
-              fpi_device_verify_report (dev, result, NULL, NULL);
+              final_verify_result = result;
               reported = TRUE;
+              reported_match = result == FPI_MATCH_SUCCESS;
               break;
             }
 
@@ -2055,17 +2351,15 @@ gdix51c0_verify_or_identify (FpDevice *dev)
         }
       else
         {
-          GPtrArray *gallery = NULL;
           FpPrint *match = NULL;
           gint best_score = 0;
           gint best_matching_medium_samples = 0;
           gint best_matching_weak_samples = 0;
           gint best_matching_strong_samples = 0;
 
-          fpi_device_get_identify_data (dev, &gallery);
-          for (guint i = 0; i < gallery->len; i++)
+          for (guint i = 0; identify_gallery && i < identify_gallery->len; i++)
             {
-              FpPrint *candidate = g_ptr_array_index (gallery, i);
+              FpPrint *candidate = g_ptr_array_index (identify_gallery, i);
               gint weak_samples = 0;
               gint medium_samples = 0;
               gint strong_samples = 0;
@@ -2095,49 +2389,50 @@ gdix51c0_verify_or_identify (FpDevice *dev)
 
           if (match || attempt == GDIX51C0_VERIFY_CAPTURE_ATTEMPTS)
             {
-              fpi_device_identify_report (dev, match, NULL, NULL);
+              final_identify_match = match;
               reported = TRUE;
+              reported_match = match != NULL;
               break;
             }
         }
     }
 
   if (!reported && !error)
-    {
-      if (action == FPI_DEVICE_ACTION_VERIFY)
-        fpi_device_verify_report (dev, FPI_MATCH_FAIL, NULL, NULL);
-      else
-        fpi_device_identify_report (dev, NULL, NULL, NULL);
-    }
+    reported = TRUE;
 
 out:
   if (probe_info)
     sigfm_free_info (probe_info);
   if (saw_finger)
     {
-      if (self->session_desynced)
-        fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NONE);
+      if (reported_match || self->session_desynced)
+        gdix51c0_report_finger_status_on_main (self, FP_FINGER_STATUS_NONE);
       else
         gdix51c0_wait_for_lift_report (self,
                                        GDIX51C0_LIFT_CLEANUP_TIMEOUT_USEC,
                                        FALSE);
     }
-  gdix51c0_session_deactivate (self);
+  if (!reported_match)
+    gdix51c0_session_deactivate (self);
 
-  if (action == FPI_DEVICE_ACTION_VERIFY)
-    fpi_device_verify_complete (dev, error);
-  else
-    fpi_device_identify_complete (dev, error);
+  gdix51c0_match_complete_on_main (self,
+                                   kind,
+                                   reported,
+                                   final_verify_result,
+                                   final_identify_match,
+                                   error);
 }
 
 static void
-gdix51c0_verify (FpDevice *dev)
+gdix51c0_verify_sync (FpDevice *dev,
+                      FpPrint  *verify_print)
 {
-  gdix51c0_verify_or_identify (dev);
+  gdix51c0_verify_or_identify (dev, GDIX51C0_ACTION_VERIFY, verify_print, NULL);
 }
 
 static void
-gdix51c0_identify (FpDevice *dev)
+gdix51c0_identify_sync (FpDevice  *dev,
+                        GPtrArray *identify_gallery)
 {
   FpiDeviceGdix51c0 *self = FPI_DEVICE_GDIX51C0 (dev);
 
@@ -2145,12 +2440,154 @@ gdix51c0_identify (FpDevice *dev)
     {
       self->skip_next_identify = FALSE;
       fp_dbg ("gdix51c0: skipping post-enrollment duplicate check");
-      fpi_device_identify_report (dev, NULL, NULL, NULL);
-      fpi_device_identify_complete (dev, NULL);
+      gdix51c0_match_complete_on_main (self,
+                                       GDIX51C0_ACTION_IDENTIFY,
+                                       TRUE,
+                                       FPI_MATCH_FAIL,
+                                       NULL,
+                                       NULL);
       return;
     }
 
-  gdix51c0_verify_or_identify (dev);
+  gdix51c0_verify_or_identify (dev, GDIX51C0_ACTION_IDENTIFY, NULL, identify_gallery);
+}
+
+static void
+gdix51c0_action_thread_free (Gdix51c0ActionThread *action)
+{
+  g_object_unref (action->dev);
+  g_clear_pointer (&action->context, g_main_context_unref);
+  g_clear_object (&action->cancellable);
+  g_clear_object (&action->enroll_print);
+  g_clear_object (&action->verify_print);
+  g_clear_pointer (&action->identify_gallery, g_ptr_array_unref);
+  g_free (action);
+}
+
+static gpointer
+gdix51c0_action_thread (gpointer user_data)
+{
+  Gdix51c0ActionThread *action = user_data;
+  FpDevice *dev = action->dev;
+  FpiDeviceGdix51c0 *self = FPI_DEVICE_GDIX51C0 (dev);
+
+  switch (action->kind)
+    {
+    case GDIX51C0_ACTION_ENROLL:
+      gdix51c0_enroll_sync (dev, action->enroll_print);
+      break;
+
+    case GDIX51C0_ACTION_VERIFY:
+      gdix51c0_verify_sync (dev, action->verify_print);
+      break;
+
+    case GDIX51C0_ACTION_IDENTIFY:
+      gdix51c0_identify_sync (dev, action->identify_gallery);
+      break;
+    }
+
+  g_clear_pointer (&self->action_context, g_main_context_unref);
+  g_clear_object (&self->action_cancellable);
+  fp_dbg ("gdix51c0: action thread exited");
+
+  gdix51c0_action_thread_free (action);
+  return NULL;
+}
+
+static void
+gdix51c0_run_action_thread (FpDevice          *dev,
+                            Gdix51c0ActionKind kind,
+                            const char        *name)
+{
+  Gdix51c0ActionThread *action = g_new0 (Gdix51c0ActionThread, 1);
+  FpiDeviceGdix51c0 *self = FPI_DEVICE_GDIX51C0 (dev);
+  GThread *thread;
+  GCancellable *cancellable;
+
+  action->dev = g_object_ref (dev);
+  action->kind = kind;
+  action->context = g_main_context_get_thread_default ();
+  if (action->context)
+    g_main_context_ref (action->context);
+  else
+    action->context = g_main_context_ref (g_main_context_default ());
+
+  cancellable = fpi_device_get_cancellable (dev);
+  action->cancellable = cancellable ? g_object_ref (cancellable) : NULL;
+
+  switch (kind)
+    {
+    case GDIX51C0_ACTION_ENROLL:
+      {
+        FpPrint *print = NULL;
+        fpi_device_get_enroll_data (dev, &print);
+        action->enroll_print = print ? g_object_ref (print) : NULL;
+        break;
+      }
+
+    case GDIX51C0_ACTION_VERIFY:
+      {
+        FpPrint *print = NULL;
+        fpi_device_get_verify_data (dev, &print);
+        action->verify_print = print ? g_object_ref (print) : NULL;
+        break;
+      }
+
+    case GDIX51C0_ACTION_IDENTIFY:
+      {
+        GPtrArray *gallery = NULL;
+
+        fpi_device_get_identify_data (dev, &gallery);
+        action->identify_gallery = g_ptr_array_new_with_free_func (g_object_unref);
+        for (guint i = 0; gallery && i < gallery->len; i++)
+          g_ptr_array_add (action->identify_gallery,
+                           g_object_ref (g_ptr_array_index (gallery, i)));
+        break;
+      }
+    }
+
+  g_clear_pointer (&self->action_context, g_main_context_unref);
+  g_clear_object (&self->action_cancellable);
+  self->action_context = g_main_context_ref (action->context);
+  self->action_cancellable = action->cancellable ? g_object_ref (action->cancellable) : NULL;
+
+  thread = g_thread_new (name, gdix51c0_action_thread, action);
+  g_thread_unref (thread);
+}
+
+static void
+gdix51c0_suspend (FpDevice *dev)
+{
+  FpiDeviceGdix51c0 *self = FPI_DEVICE_GDIX51C0 (dev);
+
+  fp_dbg ("gdix51c0: suspend requested; cancelling active action");
+  self->session_desynced = TRUE;
+  fpi_device_suspend_complete (dev, fpi_device_error_new (FP_DEVICE_ERROR_NOT_SUPPORTED));
+}
+
+static void
+gdix51c0_resume (FpDevice *dev)
+{
+  fp_dbg ("gdix51c0: resume requested after cancelled suspend action");
+  fpi_device_resume_complete (dev, fpi_device_error_new (FP_DEVICE_ERROR_NOT_SUPPORTED));
+}
+
+static void
+gdix51c0_enroll (FpDevice *dev)
+{
+  gdix51c0_run_action_thread (dev, GDIX51C0_ACTION_ENROLL, "gdix51c0-enroll");
+}
+
+static void
+gdix51c0_verify (FpDevice *dev)
+{
+  gdix51c0_run_action_thread (dev, GDIX51C0_ACTION_VERIFY, "gdix51c0-verify");
+}
+
+static void
+gdix51c0_identify (FpDevice *dev)
+{
+  gdix51c0_run_action_thread (dev, GDIX51C0_ACTION_IDENTIFY, "gdix51c0-identify");
 }
 
 /* ------------------------------------------------------------------ */
@@ -2166,7 +2603,11 @@ fpi_device_gdix51c0_init (FpiDeviceGdix51c0 *self)
 static void
 fpi_device_gdix51c0_finalize (GObject *gobject)
 {
-  gdix51c0_session_deactivate (FPI_DEVICE_GDIX51C0 (gobject));
+  FpiDeviceGdix51c0 *self = FPI_DEVICE_GDIX51C0 (gobject);
+
+  gdix51c0_session_deactivate (self);
+  g_clear_pointer (&self->action_context, g_main_context_unref);
+  g_clear_object (&self->action_cancellable);
   G_OBJECT_CLASS (fpi_device_gdix51c0_parent_class)->finalize (gobject);
 }
 
@@ -2191,6 +2632,8 @@ fpi_device_gdix51c0_class_init (FpiDeviceGdix51c0Class *klass)
   dev_class->enroll           = gdix51c0_enroll;
   dev_class->verify           = gdix51c0_verify;
   dev_class->identify         = gdix51c0_identify;
+  dev_class->suspend          = gdix51c0_suspend;
+  dev_class->resume           = gdix51c0_resume;
 
   fpi_device_class_auto_initialize_features (dev_class);
 

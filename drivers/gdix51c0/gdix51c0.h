@@ -39,9 +39,13 @@ G_DECLARE_FINAL_TYPE (FpiDeviceGdix51c0, fpi_device_gdix51c0, FPI, DEVICE_GDIX51
 #define GDIX51C0_SIGFM_TEMPLATE_KP_MIN  40
 #define GDIX51C0_SIGFM_PROBE_KP_MIN     40
 
-#define GDIX51C0_SIGFM_SCORE_WEAK       8
+/* SIFT on this 64x80 sensor produces a narrow score range — genuine matches
+ * cluster near the RANSAC min_match floor (~6) and impostor outliers can hit
+ * 20+.  Bands pulled down so genuine matches register, with a stricter
+ * decision rule that requires broad agreement instead of one-off outliers. */
+#define GDIX51C0_SIGFM_SCORE_WEAK       6
 #define GDIX51C0_SIGFM_SCORE_MEDIUM     10
-#define GDIX51C0_SIGFM_SCORE_STRONG     14
+#define GDIX51C0_SIGFM_SCORE_STRONG     16
 
 /* GPIO defaults — match protocol_interaction.py. The proper fix is to
  * resolve the IRQ line from the ACPI _CRS, but for our laptop these

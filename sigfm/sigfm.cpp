@@ -12,9 +12,28 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <vector>
+
+namespace {
+bool sigfm_debug_enabled ()
+{
+  static const bool enabled = std::getenv ("SIGFM_DEBUG") != nullptr;
+  return enabled;
+}
+
+#define SIGFM_LOG(...)                                            \
+  do {                                                            \
+    if (sigfm_debug_enabled ())                                   \
+      {                                                           \
+        std::fprintf (stderr, "sigfm: " __VA_ARGS__);             \
+        std::fputc ('\n', stderr);                                \
+      }                                                           \
+  } while (0)
+} // namespace
 
 namespace bin {
 template<>
@@ -37,13 +56,18 @@ struct deserializer<SigfmImgInfo> : public std::true_type {
 } // namespace bin
 
 namespace {
-constexpr double distance_match = 0.70;
-constexpr int min_match = 8;
-constexpr double min_inlier_ratio = 0.35;
-constexpr double ransac_reproj_threshold = 3.0;
-constexpr double max_rotation_degrees = 35.0;
-constexpr double min_scale = 0.65;
-constexpr double max_scale = 1.55;
+/* Lowe's ratio is famously unreliable on fingerprints — every ridge keypoint
+ * looks similar to its neighbors so the 2nd-best match is nearly as close as
+ * the best, killing the ratio test.  Loosened from 0.70 to 0.90 and the
+ * mutual-best filter dropped; RANSAC + scale/rotation gates downstream still
+ * reject geometrically inconsistent matches. */
+constexpr double distance_match = 0.90;
+constexpr int min_match = 6;
+constexpr double min_inlier_ratio = 0.20;
+constexpr double ransac_reproj_threshold = 5.0;
+constexpr double max_rotation_degrees = 45.0;
+constexpr double min_scale = 0.60;
+constexpr double max_scale = 1.70;
 constexpr double pi = 3.14159265358979323846;
 } // namespace
 
@@ -119,37 +143,36 @@ sigfm_match_score (SigfmImgInfo *frame, SigfmImgInfo *enrolled)
     {
       auto matcher = cv::BFMatcher::create ();
       std::vector<std::vector<cv::DMatch>> points;
-      std::vector<std::vector<cv::DMatch>> reverse_points;
       matcher->knnMatch (frame->descriptors, enrolled->descriptors, points, 2);
-      matcher->knnMatch (enrolled->descriptors, frame->descriptors, reverse_points, 2);
-
-      std::vector<int> reverse_best (enrolled->descriptors.rows, -1);
-      for (const auto &pair : reverse_points)
-        {
-          if (pair.size () < 2)
-            continue;
-
-          const cv::DMatch &first = pair[0];
-          const cv::DMatch &second = pair[1];
-          if (first.distance < distance_match * second.distance)
-            reverse_best[first.queryIdx] = first.trainIdx;
-        }
 
       std::vector<cv::DMatch> ratio_matches;
       for (const auto &pair : points)
         {
-          if (pair.size () < 2)
+          if (pair.empty ())
             continue;
+
+          if (pair.size () < 2)
+            {
+              ratio_matches.push_back (pair[0]);
+              continue;
+            }
 
           const cv::DMatch &first = pair[0];
           const cv::DMatch &second = pair[1];
-          if (first.distance < distance_match * second.distance &&
-              reverse_best[first.trainIdx] == first.queryIdx)
+          if (first.distance < distance_match * second.distance)
             ratio_matches.push_back (first);
         }
 
+      SIGFM_LOG ("descriptors probe=%d enrolled=%d ratio_matches=%zu",
+                 frame->descriptors.rows, enrolled->descriptors.rows,
+                 ratio_matches.size ());
+
       if (ratio_matches.size () < min_match)
-        return 0;
+        {
+          SIGFM_LOG ("reject: ratio_matches=%zu < min_match=%d",
+                     ratio_matches.size (), min_match);
+          return 0;
+        }
 
       std::sort (ratio_matches.begin (), ratio_matches.end (),
                  [] (const cv::DMatch &a, const cv::DMatch &b) {
@@ -170,8 +193,14 @@ sigfm_match_score (SigfmImgInfo *frame, SigfmImgInfo *enrolled)
           unique_matches.push_back (match);
         }
 
+      SIGFM_LOG ("unique_matches=%zu", unique_matches.size ());
+
       if (unique_matches.size () < min_match)
-        return 0;
+        {
+          SIGFM_LOG ("reject: unique_matches=%zu < min_match=%d",
+                     unique_matches.size (), min_match);
+          return 0;
+        }
 
       std::vector<cv::Point2f> frame_points;
       std::vector<cv::Point2f> enrolled_points;
@@ -192,7 +221,11 @@ sigfm_match_score (SigfmImgInfo *frame, SigfmImgInfo *enrolled)
                                                     0.995,
                                                     10);
       if (affine.empty () || inliers.empty ())
-        return 0;
+        {
+          SIGFM_LOG ("reject: RANSAC failed (affine.empty=%d inliers.empty=%d)",
+                     affine.empty (), inliers.empty ());
+          return 0;
+        }
 
       cv::Mat affine64;
       affine.convertTo (affine64, CV_64F);
@@ -201,17 +234,34 @@ sigfm_match_score (SigfmImgInfo *frame, SigfmImgInfo *enrolled)
       double b = affine64.at<double> (1, 0);
       double scale = std::sqrt (a * a + b * b);
       double rotation = std::abs (std::atan2 (b, a) * 180.0 / pi);
+      int count = cv::countNonZero (inliers);
+      double inlier_ratio =
+        static_cast<double> (count) / static_cast<double> (unique_matches.size ());
+
+      SIGFM_LOG ("RANSAC scale=%.3f rotation=%.1f deg inliers=%d/%zu (ratio=%.3f)",
+                 scale, rotation, count, unique_matches.size (), inlier_ratio);
 
       if (scale < min_scale || scale > max_scale || rotation > max_rotation_degrees)
-        return 0;
+        {
+          SIGFM_LOG ("reject: scale=%.3f (need %.2f..%.2f) rotation=%.1f (max %.1f)",
+                     scale, min_scale, max_scale, rotation, max_rotation_degrees);
+          return 0;
+        }
 
-      int count = cv::countNonZero (inliers);
       if (count < min_match)
-        return 0;
+        {
+          SIGFM_LOG ("reject: inlier count=%d < min_match=%d", count, min_match);
+          return 0;
+        }
 
-      if (static_cast<double> (count) / static_cast<double> (unique_matches.size ()) < min_inlier_ratio)
-        return 0;
+      if (inlier_ratio < min_inlier_ratio)
+        {
+          SIGFM_LOG ("reject: inlier_ratio=%.3f < min=%.2f",
+                     inlier_ratio, min_inlier_ratio);
+          return 0;
+        }
 
+      SIGFM_LOG ("accept: score=%d", count);
       return count;
     }
   catch (...)
