@@ -71,6 +71,7 @@ G_DEFINE_TYPE (FpiDeviceGdix51c0, fpi_device_gdix51c0, FP_TYPE_DEVICE);
 #define GDIX51C0_LIFT_CLEANUP_TIMEOUT_USEC (5 * 1000 * 1000)
 #define GDIX51C0_CANCEL_POLL_USEC       (500 * 1000)
 #define GDIX51C0_NAV_RESPONSE_LEN 2413
+#define GDIX51C0_ENROLL_TOO_SIMILAR_SCORE 32
 
 typedef enum {
   GDIX51C0_ACTION_ENROLL,
@@ -1133,6 +1134,7 @@ typedef struct {
 typedef struct {
   FpDevice *dev;
   gint      completed_stages;
+  GError   *error;
 } Gdix51c0EnrollProgressEvent;
 
 typedef struct {
@@ -1197,6 +1199,7 @@ static void
 gdix51c0_enroll_progress_event_free (Gdix51c0EnrollProgressEvent *event)
 {
   g_object_unref (event->dev);
+  g_clear_error (&event->error);
   g_free (event);
 }
 
@@ -1205,19 +1208,24 @@ gdix51c0_enroll_progress_main (gpointer user_data)
 {
   Gdix51c0EnrollProgressEvent *event = user_data;
 
-  fpi_device_enroll_progress (event->dev, event->completed_stages, NULL, NULL);
+  fpi_device_enroll_progress (event->dev,
+                              event->completed_stages,
+                              NULL,
+                              g_steal_pointer (&event->error));
   return G_SOURCE_REMOVE;
 }
 
 static void
 gdix51c0_enroll_progress_on_main (FpiDeviceGdix51c0 *self,
-                                  gint               completed_stages)
+                                  gint               completed_stages,
+                                  GError            *error)
 {
   Gdix51c0EnrollProgressEvent *event = g_new0 (Gdix51c0EnrollProgressEvent, 1);
   GMainContext *context = gdix51c0_action_context_ref (self);
 
   event->dev = g_object_ref (FP_DEVICE (self));
   event->completed_stages = completed_stages;
+  event->error = error;
   g_main_context_invoke_full (context,
                               G_PRIORITY_DEFAULT,
                               gdix51c0_enroll_progress_main,
@@ -2177,12 +2185,69 @@ gdix51c0_sigfm_is_match (gint best_score,
   return FALSE;
 }
 
+static gboolean
+gdix51c0_enroll_image_is_acceptable (FpiDeviceGdix51c0 *self,
+                                     GPtrArray         *accepted_infos,
+                                     const guint8      *image,
+                                     gint               stage,
+                                     SigfmImgInfo     **out_info)
+{
+  SigfmImgInfo *info = sigfm_extract (image,
+                                      GDIX51C0_SENSOR_WIDTH,
+                                      GDIX51C0_SENSOR_HEIGHT);
+  gint keypoints = sigfm_keypoints_count (info);
+  gint best_score = 0;
+
+  if (keypoints < GDIX51C0_SIGFM_TEMPLATE_KP_MIN)
+    {
+      fp_dbg ("gdix51c0: enrollment sample rejected at stage=%d: low keypoints=%d min=%d",
+              stage + 1,
+              keypoints,
+              GDIX51C0_SIGFM_TEMPLATE_KP_MIN);
+      sigfm_free_info (info);
+      gdix51c0_enroll_progress_on_main (self,
+                                        stage,
+                                        fpi_device_retry_new_msg (FP_DEVICE_RETRY_CENTER_FINGER,
+                                                                  "Scan quality is too low; cover the sensor more fully."));
+      return FALSE;
+    }
+
+  for (guint i = 0; i < accepted_infos->len; i++)
+    {
+      SigfmImgInfo *accepted = g_ptr_array_index (accepted_infos, i);
+      gint score = sigfm_match_score (info, accepted);
+
+      if (score > best_score)
+        best_score = score;
+    }
+
+  if (best_score >= GDIX51C0_ENROLL_TOO_SIMILAR_SCORE)
+    {
+      fp_dbg ("gdix51c0: enrollment sample rejected at stage=%d: too similar best_score=%d threshold=%d",
+              stage + 1,
+              best_score,
+              GDIX51C0_ENROLL_TOO_SIMILAR_SCORE);
+      sigfm_free_info (info);
+      gdix51c0_enroll_progress_on_main (self,
+                                        stage,
+                                        fpi_device_retry_new_msg (FP_DEVICE_RETRY_REMOVE_FINGER,
+                                                                  "Use a different part of the finger for this scan."));
+      return FALSE;
+    }
+
+  fp_dbg ("gdix51c0: enrollment sample accepted at stage=%d keypoints=%d best_similarity=%d",
+          stage + 1, keypoints, best_score);
+  *out_info = info;
+  return TRUE;
+}
+
 static void
 gdix51c0_enroll_sync (FpDevice *dev,
                       FpPrint  *print)
 {
   FpiDeviceGdix51c0 *self = FPI_DEVICE_GDIX51C0 (dev);
   g_autoptr(GPtrArray) images = NULL;
+  g_autoptr(GPtrArray) accepted_infos = NULL;
   g_autoptr(GVariant) data = NULL;
   GError *error = NULL;
 
@@ -2190,19 +2255,41 @@ gdix51c0_enroll_sync (FpDevice *dev,
     goto out;
 
   images = g_ptr_array_new_with_free_func (g_free);
-  for (gint stage = 0; stage < GDIX51C0_ENROLL_SAMPLES; stage++)
+  accepted_infos = g_ptr_array_new_with_free_func ((GDestroyNotify) sigfm_free_info);
+  for (gint stage = 0; stage < GDIX51C0_ENROLL_SAMPLES;)
     {
       guint8 *image;
+      SigfmImgInfo *info = NULL;
 
       gdix51c0_report_finger_status_on_main (self, FP_FINGER_STATUS_NEEDED);
       image = gdix51c0_capture_one_raw8 (self, &error);
       if (!image)
         goto out;
 
-      g_ptr_array_add (images, image);
-      gdix51c0_enroll_progress_on_main (self, stage + 1);
+      if (!gdix51c0_enroll_image_is_acceptable (self,
+                                                accepted_infos,
+                                                image,
+                                                stage,
+                                                &info))
+        {
+          g_free (image);
+          if (!gdix51c0_wait_for_lift_report (self,
+                                              GDIX51C0_ENROLL_LIFT_TIMEOUT_USEC,
+                                              TRUE))
+            {
+              g_set_error_literal (&error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
+                                   "gdix51c0: finger was not lifted after enrollment retry");
+              goto out;
+            }
+          continue;
+        }
 
-      if (stage + 1 < GDIX51C0_ENROLL_SAMPLES)
+      g_ptr_array_add (images, image);
+      g_ptr_array_add (accepted_infos, info);
+      stage++;
+      gdix51c0_enroll_progress_on_main (self, stage, NULL);
+
+      if (stage < GDIX51C0_ENROLL_SAMPLES)
         {
           if (!gdix51c0_wait_for_lift_report (self,
                                               GDIX51C0_ENROLL_LIFT_TIMEOUT_USEC,
