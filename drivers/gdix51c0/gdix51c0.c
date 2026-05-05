@@ -72,6 +72,14 @@ G_DEFINE_TYPE (FpiDeviceGdix51c0, fpi_device_gdix51c0, FP_TYPE_DEVICE);
 #define GDIX51C0_CANCEL_POLL_USEC       (500 * 1000)
 #define GDIX51C0_NAV_RESPONSE_LEN 2413
 #define GDIX51C0_ENROLL_TOO_SIMILAR_SCORE 32
+#define GDIX51C0_ROT_SCALE              1024
+#define GDIX51C0_ROTATED_SCORE_STRONG   18
+#define GDIX51C0_NO_MATCH_HOLD_MSEC     150
+#define GDIX51C0_DRIVER_BUILD_MARKER    "enroll-no-finger-retry-20260504"
+
+static const gint gdix51c0_probe_angles[] = { 0, -30, -20, -10, 10, 20, 30 };
+static const gint gdix51c0_probe_cos[] = { 1024, 887, 962, 1008, 1008, 962, 887 };
+static const gint gdix51c0_probe_sin[] = { 0, -512, -350, -178, 178, 350, 512 };
 
 typedef enum {
   GDIX51C0_ACTION_ENROLL,
@@ -88,6 +96,33 @@ typedef struct {
   FpPrint             *verify_print;
   GPtrArray           *identify_gallery;
 } Gdix51c0ActionThread;
+
+typedef struct {
+  SigfmImgInfo *info;
+  gint          angle;
+  guint         angle_index;
+  gint          keypoints;
+} Gdix51c0ProbeVariant;
+
+typedef struct {
+  gint best_score;
+  gint weak_samples;
+  gint medium_samples;
+  gint strong_samples;
+
+  gint base_best_score;
+  gint base_weak_samples;
+  gint base_medium_samples;
+  gint base_strong_samples;
+
+  gint dominant_angle;
+  gint dominant_weak_samples;
+  gint dominant_medium_samples;
+  gint dominant_strong_samples;
+} Gdix51c0MatchStats;
+
+static gboolean gdix51c0_action_check_cancelled (FpiDeviceGdix51c0 *self,
+                                                 GError           **error);
 
 static const guint8 gdix51c0_default_fdt_down_regs[12] = {
   0x80, 0xad, 0x80, 0xbb, 0x80, 0xa2,
@@ -238,6 +273,7 @@ gdix51c0_open (FpDevice *dev)
 
   const char *spi_path = fpi_device_get_udev_data (dev, FPI_DEVICE_UDEV_SUBTYPE_SPIDEV);
   fp_dbg ("gdix51c0: opening spidev at %s", spi_path ? spi_path : "(null)");
+  fp_info ("gdix51c0: driver build %s", GDIX51C0_DRIVER_BUILD_MARKER);
   if (!spi_path)
     {
       g_set_error_literal (&err, G_IO_ERROR, G_IO_ERROR_NOT_FOUND,
@@ -644,8 +680,12 @@ gdix51c0_session_activate_once (FpiDeviceGdix51c0 *self, GError **error)
 }
 
 static gboolean
-gdix51c0_session_activate (FpiDeviceGdix51c0 *self, GError **error)
+gdix51c0_session_activate_with_attempts (FpiDeviceGdix51c0 *self,
+                                         guint              max_attempts,
+                                         GError           **error)
 {
+  max_attempts = MAX (max_attempts, 1);
+
   if (self->tls_ready)
     {
       gdix51c0_session_reset_capture_state (self);
@@ -653,26 +693,39 @@ gdix51c0_session_activate (FpiDeviceGdix51c0 *self, GError **error)
       return TRUE;
     }
 
-  for (guint attempt = 0; attempt < 4; attempt++)
+  for (guint attempt = 0; attempt < max_attempts; attempt++)
     {
       g_autoptr(GError) local_error = NULL;
+
+      if (gdix51c0_action_check_cancelled (self, error))
+        return FALSE;
 
       if (gdix51c0_session_activate_once (self, &local_error))
         return TRUE;
 
       gdix51c0_session_deactivate (self);
 
-      if (attempt == 3)
+      if (gdix51c0_action_check_cancelled (self, error))
+        return FALSE;
+
+      if (attempt + 1 == max_attempts)
         {
           g_propagate_error (error, g_steal_pointer (&local_error));
           return FALSE;
         }
 
-      fp_warn ("gdix51c0: activation failed on attempt %u/4 (%s); resetting and retrying",
+      fp_warn ("gdix51c0: activation failed on attempt %u/%u (%s); resetting and retrying",
                attempt + 1,
+               max_attempts,
                local_error ? local_error->message : "?");
 
-      g_usleep (1000000);
+      for (guint slept_usec = 0; slept_usec < 1000000; slept_usec += 100000)
+        {
+          if (gdix51c0_action_check_cancelled (self, error))
+            return FALSE;
+
+          g_usleep (100000);
+        }
     }
 
   g_set_error_literal (error,
@@ -680,6 +733,12 @@ gdix51c0_session_activate (FpiDeviceGdix51c0 *self, GError **error)
                        G_IO_ERROR_FAILED,
                        "gdix51c0: activation failed unexpectedly");
   return FALSE;
+}
+
+static gboolean
+gdix51c0_session_activate (FpiDeviceGdix51c0 *self, GError **error)
+{
+  return gdix51c0_session_activate_with_attempts (self, 4, error);
 }
 
 static void
@@ -1300,25 +1359,62 @@ gdix51c0_match_complete_event_free (Gdix51c0MatchCompleteEvent *event)
 }
 
 static gboolean
+gdix51c0_match_complete_finish_main (gpointer user_data)
+{
+  Gdix51c0MatchCompleteEvent *event = user_data;
+
+  if (event->kind == GDIX51C0_ACTION_VERIFY)
+    fpi_device_verify_complete (event->dev, g_steal_pointer (&event->error));
+  else
+    fpi_device_identify_complete (event->dev, g_steal_pointer (&event->error));
+
+  return G_SOURCE_REMOVE;
+}
+
+static gboolean
 gdix51c0_match_complete_main (gpointer user_data)
 {
   Gdix51c0MatchCompleteEvent *event = user_data;
+  gboolean hold_no_match = FALSE;
 
   if (event->kind == GDIX51C0_ACTION_VERIFY)
     {
       if (!event->error && event->report_result)
         fpi_device_verify_report (event->dev, event->verify_result, NULL, NULL);
 
-      fpi_device_verify_complete (event->dev, g_steal_pointer (&event->error));
+      if (!event->error)
+        hold_no_match = event->verify_result == FPI_MATCH_FAIL;
+
     }
   else
     {
       if (!event->error && event->report_result)
         fpi_device_identify_report (event->dev, event->identify_match, NULL, NULL);
 
-      fpi_device_identify_complete (event->dev, g_steal_pointer (&event->error));
+      if (!event->error)
+        hold_no_match = event->identify_match == NULL;
+
     }
 
+  if (hold_no_match)
+    {
+      Gdix51c0MatchCompleteEvent *finish_event = g_new0 (Gdix51c0MatchCompleteEvent, 1);
+      GSource *source = g_timeout_source_new (GDIX51C0_NO_MATCH_HOLD_MSEC);
+
+      finish_event->dev = g_object_ref (event->dev);
+      finish_event->kind = event->kind;
+      fp_dbg ("gdix51c0: holding no-match completion for %u ms",
+              GDIX51C0_NO_MATCH_HOLD_MSEC);
+      g_source_set_callback (source,
+                             gdix51c0_match_complete_finish_main,
+                             finish_event,
+                             (GDestroyNotify) gdix51c0_match_complete_event_free);
+      g_source_attach (source, NULL);
+      g_source_unref (source);
+      return G_SOURCE_REMOVE;
+    }
+
+  gdix51c0_match_complete_finish_main (event);
   return G_SOURCE_REMOVE;
 }
 
@@ -1342,6 +1438,40 @@ gdix51c0_match_complete_on_main (FpiDeviceGdix51c0 *self,
   g_main_context_invoke_full (context,
                               G_PRIORITY_DEFAULT,
                               gdix51c0_match_complete_main,
+                              event,
+                              (GDestroyNotify) gdix51c0_match_complete_event_free);
+  g_main_context_unref (context);
+}
+
+static gboolean
+gdix51c0_match_report_main (gpointer user_data)
+{
+  Gdix51c0MatchCompleteEvent *event = user_data;
+
+  if (event->kind == GDIX51C0_ACTION_VERIFY)
+    fpi_device_verify_report (event->dev, event->verify_result, NULL, NULL);
+  else
+    fpi_device_identify_report (event->dev, event->identify_match, NULL, NULL);
+
+  return G_SOURCE_REMOVE;
+}
+
+static void
+gdix51c0_match_report_on_main (FpiDeviceGdix51c0 *self,
+                               Gdix51c0ActionKind kind,
+                               FpiMatchResult     verify_result,
+                               FpPrint           *identify_match)
+{
+  Gdix51c0MatchCompleteEvent *event = g_new0 (Gdix51c0MatchCompleteEvent, 1);
+  GMainContext *context = gdix51c0_action_context_ref (self);
+
+  event->dev = g_object_ref (FP_DEVICE (self));
+  event->kind = kind;
+  event->verify_result = verify_result;
+  event->identify_match = identify_match ? g_object_ref (identify_match) : NULL;
+  g_main_context_invoke_full (context,
+                              G_PRIORITY_DEFAULT,
+                              gdix51c0_match_report_main,
                               event,
                               (GDestroyNotify) gdix51c0_match_complete_event_free);
   g_main_context_unref (context);
@@ -1893,6 +2023,35 @@ gdix51c0_capture_error_needs_session_restart (const GError *error)
   return FALSE;
 }
 
+static gboolean
+gdix51c0_error_is_transient_verify_failure (const GError *error)
+{
+  if (!error || !error->message)
+    return FALSE;
+
+  if (strstr (error->message, "IRQ") &&
+      strstr (error->message, "never went"))
+    return TRUE;
+
+  if (strstr (error->message, "TLS handshake did not receive MCU ClientHello"))
+    return TRUE;
+
+  return FALSE;
+}
+
+static gboolean
+gdix51c0_error_is_enroll_retry_failure (const GError *error)
+{
+  if (gdix51c0_error_is_transient_verify_failure (error))
+    return TRUE;
+
+  if (error && error->message &&
+      strstr (error->message, "no finger detected within timeout"))
+    return TRUE;
+
+  return FALSE;
+}
+
 static int
 gdix51c0_u16_compare (gconstpointer a, gconstpointer b)
 {
@@ -2064,22 +2223,122 @@ gdix51c0_wait_for_lift_report (FpiDeviceGdix51c0 *self,
   return TRUE;
 }
 
+static guint8
+gdix51c0_border_average (const guint8 *image)
+{
+  guint sum = 0;
+  guint count = 0;
+
+  for (guint x = 0; x < GDIX51C0_SENSOR_WIDTH; x++)
+    {
+      sum += image[x];
+      sum += image[(GDIX51C0_SENSOR_HEIGHT - 1) * GDIX51C0_SENSOR_WIDTH + x];
+      count += 2;
+    }
+
+  for (guint y = 1; y + 1 < GDIX51C0_SENSOR_HEIGHT; y++)
+    {
+      sum += image[y * GDIX51C0_SENSOR_WIDTH];
+      sum += image[y * GDIX51C0_SENSOR_WIDTH + GDIX51C0_SENSOR_WIDTH - 1];
+      count += 2;
+    }
+
+  return (guint8) ((sum + count / 2) / count);
+}
+
+static guint8 *
+gdix51c0_rotate_raw8 (const guint8 *image,
+                      gint          cos_scaled,
+                      gint          sin_scaled)
+{
+  guint8 fill = gdix51c0_border_average (image);
+  guint8 *rotated = g_malloc (GDIX51C0_FRAME_PIXELS);
+  gint cx2 = GDIX51C0_SENSOR_WIDTH - 1;
+  gint cy2 = GDIX51C0_SENSOR_HEIGHT - 1;
+
+  for (guint y = 0; y < GDIX51C0_SENSOR_HEIGHT; y++)
+    {
+      for (guint x = 0; x < GDIX51C0_SENSOR_WIDTH; x++)
+        {
+          gint dx2 = (gint) x * 2 - cx2;
+          gint dy2 = (gint) y * 2 - cy2;
+          gint src_x2 = cx2 + (cos_scaled * dx2 + sin_scaled * dy2) / GDIX51C0_ROT_SCALE;
+          gint src_y2 = cy2 + (-sin_scaled * dx2 + cos_scaled * dy2) / GDIX51C0_ROT_SCALE;
+          gint src_x = (src_x2 + (src_x2 >= 0 ? 1 : -1)) / 2;
+          gint src_y = (src_y2 + (src_y2 >= 0 ? 1 : -1)) / 2;
+
+          if (src_x >= 0 && src_x < GDIX51C0_SENSOR_WIDTH &&
+              src_y >= 0 && src_y < GDIX51C0_SENSOR_HEIGHT)
+            rotated[y * GDIX51C0_SENSOR_WIDTH + x] = image[src_y * GDIX51C0_SENSOR_WIDTH + src_x];
+          else
+            rotated[y * GDIX51C0_SENSOR_WIDTH + x] = fill;
+        }
+    }
+
+  return rotated;
+}
+
+static void
+gdix51c0_probe_variant_free (Gdix51c0ProbeVariant *variant)
+{
+  sigfm_free_info (variant->info);
+  g_free (variant);
+}
+
+static GPtrArray *
+gdix51c0_build_probe_variants (const guint8 *image)
+{
+  GPtrArray *variants =
+    g_ptr_array_new_with_free_func ((GDestroyNotify) gdix51c0_probe_variant_free);
+
+  for (guint i = 0; i < G_N_ELEMENTS (gdix51c0_probe_angles); i++)
+    {
+      g_autofree guint8 *rotated = NULL;
+      Gdix51c0ProbeVariant *variant = g_new0 (Gdix51c0ProbeVariant, 1);
+      const guint8 *variant_image = image;
+
+      if (gdix51c0_probe_angles[i] != 0)
+        {
+          rotated = gdix51c0_rotate_raw8 (image,
+                                          gdix51c0_probe_cos[i],
+                                          gdix51c0_probe_sin[i]);
+          variant_image = rotated;
+        }
+
+      variant->angle = gdix51c0_probe_angles[i];
+      variant->angle_index = i;
+      variant->info = sigfm_extract (variant_image,
+                                     GDIX51C0_SENSOR_WIDTH,
+                                     GDIX51C0_SENSOR_HEIGHT);
+      variant->keypoints = sigfm_keypoints_count (variant->info);
+
+      fp_dbg ("gdix51c0: probe variant angle=%d keypoints=%d",
+              variant->angle, variant->keypoints);
+
+      if (variant->keypoints >= GDIX51C0_SIGFM_PROBE_KP_MIN || variant->angle == 0)
+        g_ptr_array_add (variants, variant);
+      else
+        gdix51c0_probe_variant_free (variant);
+    }
+
+  return variants;
+}
+
 static gint
-gdix51c0_match_print (SigfmImgInfo *probe_info,
-                      FpPrint      *print,
-                      gint         *out_weak_samples,
-                      gint         *out_medium_samples,
-                      gint         *out_strong_samples,
-                      GError      **error)
+gdix51c0_match_print (GPtrArray           *probe_variants,
+                      FpPrint             *print,
+                      Gdix51c0MatchStats  *stats,
+                      GError             **error)
 {
   g_autoptr(GVariant) data = NULL;
   GVariantIter iter;
   GVariant *child;
-  gint best_score = 0;
-  gint weak_samples = 0;
-  gint medium_samples = 0;
-  gint strong_samples = 0;
+  gint angle_weak[G_N_ELEMENTS (gdix51c0_probe_angles)] = { 0 };
+  gint angle_medium[G_N_ELEMENTS (gdix51c0_probe_angles)] = { 0 };
+  gint angle_strong[G_N_ELEMENTS (gdix51c0_probe_angles)] = { 0 };
   gint sample_idx = 0;
+
+  memset (stats, 0, sizeof (*stats));
 
   g_object_get (G_OBJECT (print), "fpi-data", &data, NULL);
   if (!data || !g_variant_is_of_type (data, G_VARIANT_TYPE ("aay")))
@@ -2114,24 +2373,68 @@ gdix51c0_match_print (SigfmImgInfo *probe_info,
               continue;
             }
 
-          gint score = sigfm_match_score (probe_info, template_info);
+          gint sample_best_score = 0;
+          gint sample_best_angle = 0;
+          guint sample_best_angle_index = 0;
+          gint base_score = 0;
 
-          fp_dbg ("gdix51c0: sample %d SIGFM keypoints=%d score=%d",
-                  sample_idx, template_kp, score);
+          for (guint i = 0; i < probe_variants->len; i++)
+            {
+              Gdix51c0ProbeVariant *variant = g_ptr_array_index (probe_variants, i);
+              gint score = sigfm_match_score (variant->info, template_info);
+
+              if (variant->angle == 0)
+                base_score = score;
+
+              if (score > sample_best_score)
+                {
+                  sample_best_score = score;
+                  sample_best_angle = variant->angle;
+                  sample_best_angle_index = variant->angle_index;
+                }
+            }
+
+          fp_dbg ("gdix51c0: sample %d SIGFM keypoints=%d base_score=%d best_score=%d angle=%d",
+                  sample_idx,
+                  template_kp,
+                  base_score,
+                  sample_best_score,
+                  sample_best_angle);
 
           sigfm_free_info (template_info);
 
-          if (score >= GDIX51C0_SIGFM_SCORE_WEAK)
-            weak_samples++;
+          if (base_score >= GDIX51C0_SIGFM_SCORE_WEAK)
+            stats->base_weak_samples++;
 
-          if (score >= GDIX51C0_SIGFM_SCORE_MEDIUM)
-            medium_samples++;
+          if (base_score >= GDIX51C0_SIGFM_SCORE_MEDIUM)
+            stats->base_medium_samples++;
 
-          if (score >= GDIX51C0_SIGFM_SCORE_STRONG)
-            strong_samples++;
+          if (base_score >= GDIX51C0_SIGFM_SCORE_STRONG)
+            stats->base_strong_samples++;
 
-          if (score > best_score)
-            best_score = score;
+          if (base_score > stats->base_best_score)
+            stats->base_best_score = base_score;
+
+          if (sample_best_score >= GDIX51C0_SIGFM_SCORE_WEAK)
+            {
+              stats->weak_samples++;
+              angle_weak[sample_best_angle_index]++;
+            }
+
+          if (sample_best_score >= GDIX51C0_SIGFM_SCORE_MEDIUM)
+            {
+              stats->medium_samples++;
+              angle_medium[sample_best_angle_index]++;
+            }
+
+          if (sample_best_score >= GDIX51C0_SIGFM_SCORE_STRONG)
+            {
+              stats->strong_samples++;
+              angle_strong[sample_best_angle_index]++;
+            }
+
+          if (sample_best_score > stats->best_score)
+            stats->best_score = sample_best_score;
         }
       else
         {
@@ -2143,26 +2446,38 @@ gdix51c0_match_print (SigfmImgInfo *probe_info,
       g_variant_unref (child);
     }
 
-  if (out_weak_samples)
-    *out_weak_samples = weak_samples;
+  for (guint i = 0; i < G_N_ELEMENTS (gdix51c0_probe_angles); i++)
+    {
+      if (angle_strong[i] > stats->dominant_strong_samples ||
+          (angle_strong[i] == stats->dominant_strong_samples &&
+           angle_medium[i] > stats->dominant_medium_samples))
+        {
+          stats->dominant_angle = gdix51c0_probe_angles[i];
+          stats->dominant_weak_samples = angle_weak[i];
+          stats->dominant_medium_samples = angle_medium[i];
+          stats->dominant_strong_samples = angle_strong[i];
+        }
+    }
 
-  if (out_medium_samples)
-    *out_medium_samples = medium_samples;
+  fp_dbg ("gdix51c0: match summary: base_best=%d base_weak=%d base_medium=%d base_strong=%d rotated_best=%d rotated_weak=%d rotated_medium=%d rotated_strong=%d dominant_angle=%d dominant_weak=%d dominant_medium=%d dominant_strong=%d",
+          stats->base_best_score,
+          stats->base_weak_samples,
+          stats->base_medium_samples,
+          stats->base_strong_samples,
+          stats->best_score,
+          stats->weak_samples,
+          stats->medium_samples,
+          stats->strong_samples,
+          stats->dominant_angle,
+          stats->dominant_weak_samples,
+          stats->dominant_medium_samples,
+          stats->dominant_strong_samples);
 
-  if (out_strong_samples)
-    *out_strong_samples = strong_samples;
-
-  fp_dbg ("gdix51c0: match summary: best=%d weak_samples=%d medium_samples=%d strong_samples=%d",
-          best_score, weak_samples, medium_samples, strong_samples);
-
-  return best_score;
+  return stats->best_score;
 }
 
 static gboolean
-gdix51c0_sigfm_is_match (gint best_score,
-                         gint weak_samples,
-                         gint medium_samples,
-                         gint strong_samples,
+gdix51c0_sigfm_is_match (const Gdix51c0MatchStats *stats,
                          gint probe_kp)
 {
   if (probe_kp < GDIX51C0_SIGFM_PROBE_KP_MIN)
@@ -2171,15 +2486,42 @@ gdix51c0_sigfm_is_match (gint best_score,
   /* A genuine same-finger probe should hit several enrolled samples with a
    * high inlier count, not score one outlier and a few coincidental mid
    * scores.  Require at least two strong samples plus medium/weak support. */
-  if (strong_samples >= 2 &&
-      medium_samples >= 3 &&
-      weak_samples >= 4)
+  if (stats->base_strong_samples >= 2 &&
+      stats->base_medium_samples >= 3 &&
+      stats->base_weak_samples >= 4)
     return TRUE;
 
-  if (best_score >= GDIX51C0_SIGFM_SCORE_STRONG &&
-      strong_samples >= 1 &&
-      medium_samples >= 3 &&
-      weak_samples >= 5)
+  /* Two independent strong hits are a useful high-confidence signal on this
+   * tiny sensor.  Keep the best-score floor so two marginal strong hits do
+   * not accept, but do not require broad weak support because rotated/offset
+   * genuine presses often overlap only a small subset of the template. */
+  if (stats->base_best_score >= GDIX51C0_ROTATED_SCORE_STRONG &&
+      stats->base_strong_samples >= 2 &&
+      stats->base_weak_samples >= 2)
+    return TRUE;
+
+  if (stats->base_best_score >= GDIX51C0_SIGFM_SCORE_STRONG &&
+      stats->base_strong_samples >= 1 &&
+      stats->base_medium_samples >= 3 &&
+      stats->base_weak_samples >= 5)
+    return TRUE;
+
+  /* Some genuine captures on this small 64x80 sensor produce no single
+   * strong hit, but still agree across many enrolled samples.  Accept only
+   * when that support is broad; do not accept on best-score alone. */
+  if (stats->base_best_score >= GDIX51C0_SIGFM_SCORE_MEDIUM &&
+      stats->base_medium_samples >= 3 &&
+      stats->base_weak_samples >= 5)
+    return TRUE;
+
+  /* Rotation variants expand the search space, so only trust them when many
+   * enrolled samples agree and the best matches point to the same correction. */
+  if (stats->best_score >= GDIX51C0_ROTATED_SCORE_STRONG &&
+      stats->strong_samples >= 4 &&
+      stats->medium_samples >= 6 &&
+      stats->weak_samples >= 8 &&
+      stats->dominant_strong_samples >= 3 &&
+      stats->dominant_medium_samples >= 4)
     return TRUE;
 
   return FALSE;
@@ -2264,7 +2606,33 @@ gdix51c0_enroll_sync (FpDevice *dev,
       gdix51c0_report_finger_status_on_main (self, FP_FINGER_STATUS_NEEDED);
       image = gdix51c0_capture_one_raw8 (self, &error);
       if (!image)
-        goto out;
+        {
+          if (gdix51c0_error_is_enroll_retry_failure (error))
+            {
+              gboolean restart_session = gdix51c0_error_is_transient_verify_failure (error);
+
+              fp_warn ("gdix51c0: treating enrollment capture failure as retry: %s",
+                       error ? error->message : "?");
+              g_clear_error (&error);
+
+              gdix51c0_enroll_progress_on_main (self,
+                                                stage,
+                                                fpi_device_retry_new_msg (FP_DEVICE_RETRY_REMOVE_FINGER,
+                                                                          restart_session ?
+                                                                          "Communication hiccup; lift and try this scan again." :
+                                                                          "No scan detected; press the sensor again."));
+              if (restart_session)
+                {
+                  gdix51c0_session_deactivate (self);
+                  if (!gdix51c0_session_activate (self, &error))
+                    goto out;
+                }
+
+              continue;
+            }
+
+          goto out;
+        }
 
       if (!gdix51c0_enroll_image_is_acceptable (self,
                                                 accepted_infos,
@@ -2336,11 +2704,14 @@ gdix51c0_verify_or_identify (FpDevice            *dev,
 {
   FpiDeviceGdix51c0 *self = FPI_DEVICE_GDIX51C0 (dev);
   g_autofree guint8 *image = NULL;
-  SigfmImgInfo *probe_info = NULL;
+  GPtrArray *probe_variants = NULL;
   GError *error = NULL;
   gboolean saw_finger = FALSE;
   gboolean reported = FALSE;
+  gboolean report_sent = FALSE;
   gboolean reported_match = FALSE;
+  gboolean transient_failure = FALSE;
+  gboolean lift_cleanup_ok = TRUE;
   FpiMatchResult final_verify_result = FPI_MATCH_FAIL;
   FpPrint *final_identify_match = NULL;
 
@@ -2353,12 +2724,7 @@ gdix51c0_verify_or_identify (FpDevice            *dev,
     {
       gint probe_kp;
 
-      if (probe_info)
-        {
-          sigfm_free_info (probe_info);
-          probe_info = NULL;
-        }
-
+      g_clear_pointer (&probe_variants, g_ptr_array_unref);
       g_clear_pointer (&image, g_free);
 
       if (attempt > 1)
@@ -2385,8 +2751,8 @@ gdix51c0_verify_or_identify (FpDevice            *dev,
         }
 
       saw_finger = TRUE;
-      probe_info = sigfm_extract (image, GDIX51C0_SENSOR_WIDTH, GDIX51C0_SENSOR_HEIGHT);
-      probe_kp = sigfm_keypoints_count (probe_info);
+      probe_variants = gdix51c0_build_probe_variants (image);
+      probe_kp = ((Gdix51c0ProbeVariant *) g_ptr_array_index (probe_variants, 0))->keypoints;
 
       fp_dbg ("gdix51c0: SIGFM probe keypoints: %d attempt=%u",
               probe_kp, attempt);
@@ -2404,26 +2770,24 @@ gdix51c0_verify_or_identify (FpDevice            *dev,
 
       if (kind == GDIX51C0_ACTION_VERIFY)
         {
-          gint best_score = 0;
-          gint weak_samples = 0;
-          gint medium_samples = 0;
-          gint strong_samples = 0;
+          Gdix51c0MatchStats stats;
           FpiMatchResult result;
 
-          best_score = gdix51c0_match_print (probe_info, verify_template,
-                                             &weak_samples, &medium_samples, &strong_samples, &error);
+          gdix51c0_match_print (probe_variants, verify_template, &stats, &error);
           if (error)
             goto out;
 
-          result = gdix51c0_sigfm_is_match (best_score, weak_samples, medium_samples, strong_samples, probe_kp) ?
+          result = gdix51c0_sigfm_is_match (&stats, probe_kp) ?
                    FPI_MATCH_SUCCESS : FPI_MATCH_FAIL;
 
-          fp_dbg ("gdix51c0: verify decision attempt=%u best=%d weak_samples=%d medium_samples=%d strong_samples=%d result=%s",
+          fp_dbg ("gdix51c0: verify decision attempt=%u base_best=%d rotated_best=%d base_strong=%d rotated_strong=%d dominant_angle=%d dominant_strong=%d result=%s",
                   attempt,
-                  best_score,
-                  weak_samples,
-                  medium_samples,
-                  strong_samples,
+                  stats.base_best_score,
+                  stats.best_score,
+                  stats.base_strong_samples,
+                  stats.strong_samples,
+                  stats.dominant_angle,
+                  stats.dominant_strong_samples,
                   result == FPI_MATCH_SUCCESS ? "MATCH" : "NO_MATCH");
 
           if (result == FPI_MATCH_SUCCESS || attempt == GDIX51C0_VERIFY_CAPTURE_ATTEMPTS)
@@ -2431,6 +2795,14 @@ gdix51c0_verify_or_identify (FpDevice            *dev,
               final_verify_result = result;
               reported = TRUE;
               reported_match = result == FPI_MATCH_SUCCESS;
+              if (!reported_match)
+                {
+                  gdix51c0_match_report_on_main (self,
+                                                 GDIX51C0_ACTION_VERIFY,
+                                                 FPI_MATCH_FAIL,
+                                                 NULL);
+                  report_sent = TRUE;
+                }
               break;
             }
 
@@ -2440,38 +2812,33 @@ gdix51c0_verify_or_identify (FpDevice            *dev,
         {
           FpPrint *match = NULL;
           gint best_score = 0;
-          gint best_matching_medium_samples = 0;
-          gint best_matching_weak_samples = 0;
-          gint best_matching_strong_samples = 0;
+          Gdix51c0MatchStats best_stats = { 0 };
 
           for (guint i = 0; identify_gallery && i < identify_gallery->len; i++)
             {
               FpPrint *candidate = g_ptr_array_index (identify_gallery, i);
-              gint weak_samples = 0;
-              gint medium_samples = 0;
-              gint strong_samples = 0;
-              gint score = gdix51c0_match_print (probe_info, candidate,
-                                                 &weak_samples, &medium_samples, &strong_samples, &error);
+              Gdix51c0MatchStats stats;
+              gint score = gdix51c0_match_print (probe_variants, candidate, &stats, &error);
               if (error)
                 goto out;
 
-              if (gdix51c0_sigfm_is_match (score, weak_samples, medium_samples, strong_samples, probe_kp) &&
+              if (gdix51c0_sigfm_is_match (&stats, probe_kp) &&
                   score > best_score)
                 {
                   best_score = score;
-                  best_matching_medium_samples = medium_samples;
-                  best_matching_weak_samples = weak_samples;
-                  best_matching_strong_samples = strong_samples;
+                  best_stats = stats;
                   match = candidate;
                 }
             }
 
-          fp_dbg ("gdix51c0: identify decision attempt=%u best=%d weak_samples=%d medium_samples=%d strong_samples=%d result=%s",
+          fp_dbg ("gdix51c0: identify decision attempt=%u base_best=%d rotated_best=%d base_strong=%d rotated_strong=%d dominant_angle=%d dominant_strong=%d result=%s",
                   attempt,
+                  best_stats.base_best_score,
                   best_score,
-                  best_matching_weak_samples,
-                  best_matching_medium_samples,
-                  best_matching_strong_samples,
+                  best_stats.base_strong_samples,
+                  best_stats.strong_samples,
+                  best_stats.dominant_angle,
+                  best_stats.dominant_strong_samples,
                   match ? "MATCH" : "NO_MATCH");
 
           if (match || attempt == GDIX51C0_VERIFY_CAPTURE_ATTEMPTS)
@@ -2479,32 +2846,68 @@ gdix51c0_verify_or_identify (FpDevice            *dev,
               final_identify_match = match;
               reported = TRUE;
               reported_match = match != NULL;
+              if (!reported_match)
+                {
+                  gdix51c0_match_report_on_main (self,
+                                                 GDIX51C0_ACTION_IDENTIFY,
+                                                 FPI_MATCH_FAIL,
+                                                 NULL);
+                  report_sent = TRUE;
+                }
               break;
             }
         }
     }
 
   if (!reported && !error)
-    reported = TRUE;
+    {
+      reported = TRUE;
+      gdix51c0_match_report_on_main (self,
+                                     kind,
+                                     FPI_MATCH_FAIL,
+                                     NULL);
+      report_sent = TRUE;
+    }
 
 out:
-  if (probe_info)
-    sigfm_free_info (probe_info);
+  g_clear_pointer (&probe_variants, g_ptr_array_unref);
+  transient_failure = gdix51c0_error_is_transient_verify_failure (error);
+  if (transient_failure)
+    {
+      fp_warn ("gdix51c0: treating transient verify/identify failure as no-match: %s",
+               error ? error->message : "?");
+
+      if (!reported)
+        {
+          reported = TRUE;
+          gdix51c0_match_report_on_main (self,
+                                         kind,
+                                         FPI_MATCH_FAIL,
+                                         NULL);
+          report_sent = TRUE;
+        }
+    }
+
   if (saw_finger)
     {
       if (reported_match || self->session_desynced)
         gdix51c0_report_finger_status_on_main (self, FP_FINGER_STATUS_NONE);
       else
-        gdix51c0_wait_for_lift_report (self,
-                                       GDIX51C0_LIFT_CLEANUP_TIMEOUT_USEC,
-                                       FALSE);
+        lift_cleanup_ok = gdix51c0_wait_for_lift_report (self,
+                                                         GDIX51C0_LIFT_CLEANUP_TIMEOUT_USEC,
+                                                         FALSE);
     }
-  if (!reported_match)
+  if (error || self->session_desynced || !lift_cleanup_ok)
     gdix51c0_session_deactivate (self);
+  else if (!reported_match)
+    fp_dbg ("gdix51c0: keeping TLS session active after clean no-match");
+
+  if (transient_failure)
+    g_clear_error (&error);
 
   gdix51c0_match_complete_on_main (self,
                                    kind,
-                                   reported,
+                                   reported && !report_sent,
                                    final_verify_result,
                                    final_identify_match,
                                    error);

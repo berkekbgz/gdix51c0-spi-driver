@@ -1,0 +1,11 @@
+# Bind the Goodix GDIX51C0 SPI fingerprint sensor to the spidev userspace
+# driver so the libfprint driver in this repo can talk to it via /dev/spidevN.M.
+#
+# The kernel ships no driver for this ACPI ID, so the device sits unbound
+# after boot.  We claim it for spidev: write driver_override=spidev to make
+# any future re-probe pick spidev, and write the device name into the
+# spidev driver's bind sysfs to attach it now.  The `|| true` keeps reruns
+# (e.g. udevadm trigger after the device is already bound) from erroring.
+ACTION=="add|change", SUBSYSTEM=="spi", KERNEL=="spi-GDIX51C0:*", \
+    ATTR{driver_override}="spidev", \
+    RUN+="/bin/sh -c 'echo %k > /sys/bus/spi/drivers/spidev/bind 2>/dev/null || true'"
