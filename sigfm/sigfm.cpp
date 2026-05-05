@@ -69,6 +69,106 @@ constexpr double max_rotation_degrees = 45.0;
 constexpr double min_scale = 0.60;
 constexpr double max_scale = 1.70;
 constexpr double pi = 3.14159265358979323846;
+
+/* Ridge enhancement: oriented Gabor filtering before SIFT.  On this 64x80
+ * sensor, raw ridges look noisy and SIFT keypoints land on speckle as much
+ * as on real ridge structure, which is why genuine and impostor scores
+ * collapse into the same range.  Enhancing first sharpens ridges along the
+ * locally-estimated orientation so SIFT keypoints anchor to real features.
+ *
+ * Tunable for this sensor's pixel pitch — adjust if scores look off after
+ * re-enrollment. */
+constexpr int    orientation_block_size = 8;
+constexpr int    gabor_kernel_size      = 11;
+constexpr int    n_orientations         = 16;
+constexpr double ridge_wavelength       = 9.0;
+
+cv::Mat
+compute_orientation_field (const cv::Mat &src)
+{
+  cv::Mat src32;
+  src.convertTo (src32, CV_32F);
+
+  cv::Mat gx, gy;
+  cv::Sobel (src32, gx, CV_32F, 1, 0, 3);
+  cv::Sobel (src32, gy, CV_32F, 0, 1, 3);
+
+  cv::Mat gxx = gx.mul (gx);
+  cv::Mat gyy = gy.mul (gy);
+  cv::Mat gxy = gx.mul (gy);
+
+  cv::Size win (orientation_block_size, orientation_block_size);
+  cv::Mat sxx, syy, sxy;
+  cv::boxFilter (gxx, sxx, CV_32F, win);
+  cv::boxFilter (gyy, syy, CV_32F, win);
+  cv::boxFilter (gxy, sxy, CV_32F, win);
+
+  /* Smooth via cos(2θ)/sin(2θ) so circular wrap doesn't bite. */
+  cv::Mat num = 2.0f * sxy;
+  cv::Mat den = sxx - syy;
+  cv::Mat cos2t (src.rows, src.cols, CV_32F);
+  cv::Mat sin2t (src.rows, src.cols, CV_32F);
+  for (int y = 0; y < src.rows; y++)
+    for (int x = 0; x < src.cols; x++)
+      {
+        double phi = std::atan2 (num.at<float> (y, x), den.at<float> (y, x));
+        cos2t.at<float> (y, x) = (float) std::cos (phi);
+        sin2t.at<float> (y, x) = (float) std::sin (phi);
+      }
+
+  cv::GaussianBlur (cos2t, cos2t, cv::Size (5, 5), 1.5);
+  cv::GaussianBlur (sin2t, sin2t, cv::Size (5, 5), 1.5);
+
+  cv::Mat orientation (src.rows, src.cols, CV_32F);
+  for (int y = 0; y < src.rows; y++)
+    for (int x = 0; x < src.cols; x++)
+      {
+        /* gradient direction = ½ atan2(...); ridge dir is +π/2. */
+        double phi = std::atan2 (sin2t.at<float> (y, x), cos2t.at<float> (y, x));
+        double theta = 0.5 * phi + pi / 2.0;
+        while (theta < 0) theta += pi;
+        while (theta >= pi) theta -= pi;
+        orientation.at<float> (y, x) = (float) theta;
+      }
+
+  return orientation;
+}
+
+cv::Mat
+apply_oriented_gabor (const cv::Mat &src, const cv::Mat &orientation)
+{
+  cv::Mat src32;
+  src.convertTo (src32, CV_32F);
+
+  std::vector<cv::Mat> bank (n_orientations);
+  for (int i = 0; i < n_orientations; i++)
+    {
+      double theta = i * pi / n_orientations;
+      cv::Mat kernel = cv::getGaborKernel (
+        cv::Size (gabor_kernel_size, gabor_kernel_size),
+        ridge_wavelength / 2.0,  /* sigma */
+        theta,
+        ridge_wavelength,        /* lambda */
+        0.5,                     /* gamma */
+        0.0,                     /* psi */
+        CV_32F);
+      cv::filter2D (src32, bank[i], CV_32F, kernel);
+    }
+
+  cv::Mat picked (src.rows, src.cols, CV_32F);
+  for (int y = 0; y < src.rows; y++)
+    for (int x = 0; x < src.cols; x++)
+      {
+        double theta = orientation.at<float> (y, x);
+        int idx = (int) std::lround (theta * n_orientations / pi) % n_orientations;
+        if (idx < 0) idx += n_orientations;
+        picked.at<float> (y, x) = bank[idx].at<float> (y, x);
+      }
+
+  cv::Mat enhanced;
+  cv::normalize (picked, enhanced, 0, 255, cv::NORM_MINMAX, CV_8U);
+  return enhanced;
+}
 } // namespace
 
 SigfmImgInfo *
@@ -123,8 +223,11 @@ sigfm_extract (const SigfmPix *pix, int width, int height)
   cv::Mat image (height, width, CV_8UC1);
   std::memcpy (image.data, pix, static_cast<std::size_t> (width * height));
 
-  cv::Mat enhanced;
-  cv::createCLAHE (4.0, cv::Size (4, 4))->apply (image, enhanced);
+  cv::Mat clahe_out;
+  cv::createCLAHE (4.0, cv::Size (4, 4))->apply (image, clahe_out);
+
+  cv::Mat orientation = compute_orientation_field (clahe_out);
+  cv::Mat enhanced = apply_oriented_gabor (clahe_out, orientation);
 
   std::vector<cv::KeyPoint> keypoints;
   cv::Mat descriptors;

@@ -60,7 +60,7 @@ struct _FpiDeviceGdix51c0
 G_DEFINE_TYPE (FpiDeviceGdix51c0, fpi_device_gdix51c0, FP_TYPE_DEVICE);
 
 #define GDIX51C0_TOUCH_IGNORE 0xff
-#define GDIX51C0_VERIFY_CAPTURE_ATTEMPTS 1
+#define GDIX51C0_VERIFY_CAPTURE_ATTEMPTS 3
 #define GDIX51C0_FDT_UP_THRESHOLD_OFFSET 29
 /* Minimum time to wait for an armed FDT-up event to fire so we can drain it.
  * The device typically fires ~70 ms after arming; if we abandon the read
