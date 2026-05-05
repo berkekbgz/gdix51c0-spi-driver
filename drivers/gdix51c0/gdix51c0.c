@@ -55,6 +55,12 @@ struct _FpiDeviceGdix51c0
   guint16                    fdt_down_sample[6];
   gboolean                   fdt_down_sample_valid;
   gboolean                   require_lift_gap;
+
+  /* Per-pixel dark-frame baseline captured via cmd 0x20 once per session.
+   * Subtracted from each finger frame before percentile-stretch normalization
+   * so fixed-pattern sensor noise does not steal contrast from real ridges. */
+  guint16                    t0_baseline[GDIX51C0_FRAME_PIXELS];
+  gboolean                   t0_baseline_valid;
 };
 
 G_DEFINE_TYPE (FpiDeviceGdix51c0, fpi_device_gdix51c0, FP_TYPE_DEVICE);
@@ -75,7 +81,7 @@ G_DEFINE_TYPE (FpiDeviceGdix51c0, fpi_device_gdix51c0, FP_TYPE_DEVICE);
 #define GDIX51C0_ROT_SCALE              1024
 #define GDIX51C0_ROTATED_SCORE_STRONG   18
 #define GDIX51C0_NO_MATCH_HOLD_MSEC     150
-#define GDIX51C0_DRIVER_BUILD_MARKER    "enroll-no-finger-retry-20260504"
+#define GDIX51C0_DRIVER_BUILD_MARKER    "dark-frame-optin-20260505"
 
 static const gint gdix51c0_probe_angles[] = { 0, -30, -20, -10, 10, 20, 30 };
 static const gint gdix51c0_probe_cos[] = { 1024, 887, 962, 1008, 1008, 962, 887 };
@@ -594,6 +600,10 @@ gdix51c0_load_psk (guint8 out[32], GError **err)
 }
 
 static void gdix51c0_session_deactivate (FpiDeviceGdix51c0 *self);
+static guint16 *gdix51c0_capture_image_raw (FpiDeviceGdix51c0 *self,
+                                            guint8             cmd,
+                                            gboolean           retry_image,
+                                            GError           **error);
 
 static gboolean
 gdix51c0_session_tls_start (FpiDeviceGdix51c0 *self, GError **error)
@@ -658,9 +668,53 @@ gdix51c0_session_reset_capture_state (FpiDeviceGdix51c0 *self)
   self->session_desynced = FALSE;
   self->fdt_down_sample_valid = FALSE;
   self->require_lift_gap = FALSE;
+  self->t0_baseline_valid = FALSE;
   memcpy (self->fdt_down_regs,
           gdix51c0_default_fdt_down_regs,
           sizeof (self->fdt_down_regs));
+}
+
+/* Best-effort: capture a finger-off baseline (cmd 0x20) so that the next
+ * finger frame can be subtracted to remove fixed-pattern sensor noise.
+ *
+ * Called once per session, immediately after TLS handshake.  The user is
+ * almost always finger-off at this point (they've just invoked
+ * fprintd-verify/enroll and haven't pressed yet), so we capture without a
+ * touch probe.  If the user happens to be touching, the baseline will
+ * contain ridges and the first capture will look erased — auto-retry then
+ * picks up cleanly on the next press, which is acceptable.
+ *
+ * Failures here are non-fatal: we just leave t0_baseline_valid=FALSE and
+ * fall back to un-subtracted captures. */
+static void
+gdix51c0_session_capture_baseline (FpiDeviceGdix51c0 *self)
+{
+  g_autoptr(GError) error = NULL;
+  g_autofree guint16 *raw = NULL;
+
+  raw = gdix51c0_capture_image_raw (self, GDIX51C0_CMD_IMAGE_T0, FALSE, &error);
+  if (!raw)
+    {
+      fp_warn ("gdix51c0: dark-frame capture failed (continuing without subtraction): %s",
+               error ? error->message : "?");
+      return;
+    }
+
+  memcpy (self->t0_baseline, raw, sizeof (self->t0_baseline));
+  self->t0_baseline_valid = TRUE;
+
+  guint64 sum = 0;
+  guint16 mn = 0xffff;
+  guint16 mx = 0;
+  for (gsize i = 0; i < GDIX51C0_FRAME_PIXELS; i++)
+    {
+      guint16 v = self->t0_baseline[i];
+      sum += v;
+      if (v < mn) mn = v;
+      if (v > mx) mx = v;
+    }
+  fp_dbg ("gdix51c0: dark-frame baseline captured: mean=%u min=%u max=%u",
+          (guint) (sum / GDIX51C0_FRAME_PIXELS), mn, mx);
 }
 
 static gboolean
@@ -676,7 +730,11 @@ gdix51c0_session_activate_once (FpiDeviceGdix51c0 *self, GError **error)
   if (!gdix51c0_init_sequence (self, error))
     return FALSE;
 
-  return gdix51c0_session_tls_start (self, error);
+  if (!gdix51c0_session_tls_start (self, error))
+    return FALSE;
+
+  gdix51c0_session_capture_baseline (self);
+  return TRUE;
 }
 
 static gboolean
@@ -1753,16 +1811,20 @@ gdix51c0_dump_debug_views (const guint16 *raw)
 /* ------------------------------------------------------------------ */
 static guint16 *
 gdix51c0_capture_image_raw (FpiDeviceGdix51c0 *self,
+                            guint8             cmd,
                             gboolean           retry_image,
                             GError           **error)
 {
-  const guint8 img_setmode[] = {
-    GDIX51C0_CMD_IMAGE_T1,
+  guint8 img_setmode[] = {
+    cmd,
     0x03, 0x00,
     0x01,
     0x00,
-    0x84
+    0x00,
   };
+
+  img_setmode[5] = gdix51c0_payload_checksum (img_setmode,
+                                              sizeof (img_setmode) - 1);
 
   (void) retry_image;
 
@@ -2151,7 +2213,7 @@ gdix51c0_capture_one_raw8 (FpiDeviceGdix51c0 *self, GError **error)
 
       gdix51c0_report_finger_status_on_main (self, FP_FINGER_STATUS_PRESENT);
 
-      raw = gdix51c0_capture_image_raw (self, FALSE, &local_error);
+      raw = gdix51c0_capture_image_raw (self, GDIX51C0_CMD_IMAGE_T1, FALSE, &local_error);
       if (!raw)
         {
           if (gdix51c0_capture_error_needs_session_restart (local_error) &&
@@ -2180,6 +2242,37 @@ gdix51c0_capture_one_raw8 (FpiDeviceGdix51c0 *self, GError **error)
         {
           g_propagate_error (error, g_steal_pointer (&local_error));
           return NULL;
+        }
+
+      /* Dark-frame subtraction is opt-in (GDIX51C0_ENABLE_DARK_FRAME=1).
+       * The cmd 0x20 baseline isn't reliably finger-off — we sometimes
+       * capture during a press — and the per-pixel correction is only
+       * useful when the baseline genuinely captures fixed-pattern noise.
+       * Until we have proper RE for the right capture mode and a
+       * finger-off check, leave subtraction off by default. */
+      if (self->t0_baseline_valid &&
+          g_getenv ("GDIX51C0_ENABLE_DARK_FRAME"))
+        {
+          /* Per-pixel deviation correction: each pixel keeps its global
+           * brightness but loses its fixed offset relative to the array
+           * mean.  Naive raw - baseline wipes the signal because finger
+           * frames are typically *darker* than the no-finger baseline. */
+          guint64 sum = 0;
+          for (gsize i = 0; i < GDIX51C0_FRAME_PIXELS; i++)
+            sum += self->t0_baseline[i];
+          guint mean = (guint) (sum / GDIX51C0_FRAME_PIXELS);
+
+          for (gsize i = 0; i < GDIX51C0_FRAME_PIXELS; i++)
+            {
+              gint32 corrected = (gint32) raw[i]
+                                 - (gint32) self->t0_baseline[i]
+                                 + (gint32) mean;
+              if (corrected < 0) corrected = 0;
+              if (corrected > 4095) corrected = 4095;
+              raw[i] = (guint16) corrected;
+            }
+          fp_dbg ("gdix51c0: applied dark-frame subtraction (baseline mean=%u)",
+                  mean);
         }
 
       return gdix51c0_normalize_raw8 (raw);
